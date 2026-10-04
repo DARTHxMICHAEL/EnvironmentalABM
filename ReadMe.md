@@ -1,6 +1,6 @@
 # Environmental ABM
 
-A grid-based agent-based model where agents forage, fight and reproduce. It continues the [thesis version](https://github.com/DARTHxMICHAEL/EvolutionaryABM) with the model bugs fixed (see [Changes from the thesis version](#changes-from-the-thesis-version)). The model measures how sensitive the dynamics are to small perturbations, using a finite-time Lyapunov exponent, Shannon entropy and population regime statistics. Agents move either at random or with a small neural network that evolves through basic crossover and mutation.
+A grid-based agent-based model where agents forage, fight and reproduce. The model measures how sensitive the dynamics are to small perturbations, using a finite-time Lyapunov exponent, Shannon entropy and population regime statistics. Agents move either at random or with a small neural network that evolves through basic crossover and mutation.
 
 ## Model
 
@@ -70,25 +70,50 @@ Results are averaged over `num_runs` trials. Before the trials start, a determin
 ## Usage
 
 ```bash
-pip install numpy matplotlib
-python environmental_abm.py           # run the experiments
+sudo apt install python3.12-venv     # Ubuntu/Debian only, if venv is missing
+python3 -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 python -m unittest -v                # run the tests
+python environmental_abm.py          # run the experiments
 ```
+
+Tested with Python 3.12, numpy 2.5.3 and matplotlib 3.11.2.
 
 The script runs three experiments one after another:
 1. Random agents in the near-critical regime
 2. Neural agents in the near-critical regime
 3. Random agents under the same constraints as experiment 2
 
-Settings are at the bottom of the file: `grid_params`, `num_runs`, `num_ticks`, `num_prtrb_agents`, `init_seed` and `cutoff`. The defaults (20 runs × 15,000 ticks each) open many plot windows. The parameter sets were tuned with the thesis version and need recalibrating for the fixed model.
+Settings are at the bottom of the file: `grid_params`, `num_runs`, `num_ticks`, `num_prtrb_agents`, `init_seed` and `cutoff`.
 
-## Changes from the thesis version
+## Viewing plots
 
-The thesis results come from [EvolutionaryABM](https://github.com/DARTHxMICHAEL/EvolutionaryABM), which had these bugs:
+**Jupyter (recommended).** Plots appear in the browser, under the cell that made them.
 
-1. **Most agents skipped most ticks.** The tick loop stopped (`return`) at the first agent that another agent had already removed in that tick. In dense populations only about 1–5% of agents moved and paid metabolism each tick. The saturated grids and the energy levels reported in the thesis come mainly from this bug.
-2. **Agents vanished from the grid.** After a failed mating, the moving agent stepped onto its partner's cell. The partner stayed in the agent list but disappeared from the grid until it moved again, so population counts and grid metrics (entropy, $d(t)$) disagreed.
-3. **The reproduction cost did not match the description.** Children split the parents' energy from *before* the cost. The thesis (Section 3.3) describes the energy *after* the cost, which is what the model does now.
-4. **Agents could live with negative energy.** Parents could survive a failed mating with $E \le 0$, and a fight against such an agent reduced the winner's energy.
+```bash
+pip install notebook
+jupyter notebook --ServerApp.use_redirect_file=False
+```
 
-The tests in `test_environmental_abm.py` check the properties these bugs broke: every agent acts exactly once per tick, the agent and food lists match the grid, no living agent has $E \le 0$, the energy budget balances every tick, and the mating rules hold.
+If no browser opens, copy the `http://localhost:8888/tree?token=...` link from the terminal. In a new notebook, run all experiments with:
+
+```python
+%run environmental_abm.py
+```
+
+Or run a single setup. With `final_render=False, lyapunov_final_render=False`, you get only the divergence plot for each run:
+
+```python
+from environmental_abm import main_simulation
+
+main_simulation(
+    num_runs=5, num_ticks=2000, num_prtrb_agents=2, init_seed=123, cutoff=0.015,
+    final_render=False, lyapunov_final_render=False,
+    width=100, height=100, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=8,
+    food_respawn_rate=0.012, num_agents=80, num_apples=900, num_oranges=900,
+    num_walls=60, use_nn=False,
+)
+```
+
+**Plot windows.** Running `python environmental_abm.py` opens each plot in its own window. This needs Tk: install it with `sudo apt install python3-tk` on Ubuntu/Debian. Without Tk, matplotlib shows nothing.

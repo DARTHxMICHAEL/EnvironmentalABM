@@ -860,7 +860,7 @@ def check_determinism(num_ticks, seed, debug_render=False, final_render=True, **
 	return True
 
 
-def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=True, lyapunov_final_render=True, **grid_params):
+def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=False, lyapunov_final_render=False, **grid_params):
 	"""
 	Execute the main experiment pipeline.
 
