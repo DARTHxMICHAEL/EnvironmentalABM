@@ -78,7 +78,7 @@ python -m unittest -v                # run the tests
 python environmental_abm.py          # run the experiments
 ```
 
-Tested with Python 3.12, numpy 2.5.3 and matplotlib 3.11.2.
+Tested with Python 3.12, numpy 2.5.3, matplotlib 3.11.2 and notebook 7.6.3.
 
 The script runs three experiments one after another:
 1. Random agents in the near-critical regime
@@ -89,10 +89,10 @@ Settings are at the bottom of the file: `grid_params`, `num_runs`, `num_ticks`, 
 
 ## Viewing plots
 
-**Jupyter (recommended).** Plots appear in the browser, under the cell that made them.
+**Jupyter (recommended).** Plots appear in the browser, under the cell that made them. With the venv active:
 
 ```bash
-pip install notebook
+source .venv/bin/activate # if not used before
 jupyter notebook --ServerApp.use_redirect_file=False
 ```
 
@@ -108,10 +108,10 @@ Or run a single setup. With `final_render=False, lyapunov_final_render=False`, y
 from environmental_abm import main_simulation
 
 main_simulation(
-    num_runs=5, num_ticks=2000, num_prtrb_agents=2, init_seed=123, cutoff=0.015,
+    num_runs=10, num_ticks=4000, num_prtrb_agents=2, init_seed=123, cutoff=0.015,
     final_render=False, lyapunov_final_render=False,
-    width=100, height=100, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=8,
-    food_respawn_rate=0.012, num_agents=80, num_apples=900, num_oranges=900,
+    width=100, height=100, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=2,
+    food_respawn_rate=0.012, num_agents=120, num_apples=900, num_oranges=900,
     num_walls=60, use_nn=False,
 )
 ```
