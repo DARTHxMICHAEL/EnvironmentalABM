@@ -860,7 +860,7 @@ def check_determinism(num_ticks, seed, debug_render=False, final_render=True, **
 	return True
 
 
-def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=False, lyapunov_final_render=False, **grid_params):
+def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=False, lyapunov_final_render=True, **grid_params):
 	"""
 	Execute the main experiment pipeline.
 
@@ -943,9 +943,9 @@ if __name__ == "__main__":
 		"height": 100,
 		"metabolic_cost":0.9,
 		"min_child_energy": 7,
-		"reproduction_cost": 8,
+		"reproduction_cost": 2,
 		"food_respawn_rate": 0.012,
-		"num_agents": 15,
+		"num_agents": 20,
 		"num_apples": 30,
 		"num_oranges": 30,
 		"num_walls": 60,
@@ -980,9 +980,9 @@ if __name__ == "__main__":
 		"height": 100,
 		"metabolic_cost":0.9,
 		"min_child_energy": 7,
-		"reproduction_cost": 8,
+		"reproduction_cost": 2,
 		"food_respawn_rate": 0.012,
-		"num_agents": 80,
+		"num_agents": 120,
 		"num_apples": 900,
 		"num_oranges": 900,
 		"num_walls": 60,
@@ -1021,9 +1021,9 @@ if __name__ == "__main__":
 		"height": 100,
 		"metabolic_cost":0.9,
 		"min_child_energy": 7,
-		"reproduction_cost": 8,
+		"reproduction_cost": 2,
 		"food_respawn_rate": 0.012,
-		"num_agents": 80,
+		"num_agents": 120,
 		"num_apples": 900,
 		"num_oranges": 900,
 		"num_walls": 60,
