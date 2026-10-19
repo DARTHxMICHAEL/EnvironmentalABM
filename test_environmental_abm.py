@@ -12,7 +12,8 @@ matplotlib.use("Agg")
 import numpy as np
 
 from environmental_abm import (
-	Agent, Food, Grid, SimpleNN, Wall, grid_difference, main_simulation, population_stats
+	BASELINE_SEED_OFFSET, SERIES, Agent, Food, Grid, SimpleNN, Wall, divergence_stats,
+	event_rates, grid_difference, main_simulation, population_stats, split_rate_if_independent
 )
 
 
@@ -178,6 +179,67 @@ class MatingTest(unittest.TestCase):
 		self.assertEqual(grid.stats["births"], 0)
 
 
+class InheritanceTest(unittest.TestCase):
+
+	def test_siblings_get_different_mutations(self):
+		# networks used to deep-copy their parent's RNG, so from the second generation on
+		# all children of one parent mutated identically
+		grid = empty_grid(use_nn=True)
+		a = add_agent(grid, 5, 5, sex=0, energy=30)
+		b = add_agent(grid, 5, 6, sex=1, energy=30)
+		parent = grid.cross_mutate(a.nn, b.nn)
+		self.assertIs(parent.rng, grid.rng)
+
+		# crossing a network with itself leaves only the mutation
+		children = [grid.cross_mutate(parent, parent) for _ in range(3)]
+		self.assertFalse(np.array_equal(children[0].W1, children[1].W1))
+		self.assertFalse(np.array_equal(children[1].W1, children[2].W1))
+
+
+class DivergenceTest(unittest.TestCase):
+
+	def test_divergence_stats(self):
+		# latent for 3 ticks, then a jump (desync) and a rise to the 0.4 plateau
+		d = [1e-4, 1e-4, 1e-4, 1e-4, 0.05, 0.1, 0.25, 0.4, 0.4]
+		s = divergence_stats(d, d_ref=0.4, cells=1000)
+		self.assertEqual(s["desync_tick"], 4)  # first d >= 10 cells / 1000
+		self.assertEqual(s["half_tick"], 6)    # first d >= 0.2
+		self.assertAlmostEqual(s["lyapunov"], np.log(0.25 / 1e-4) / 6)
+
+	def test_divergence_never_spreads(self):
+		s = divergence_stats([1e-4, 2e-4, 1e-4], d_ref=0.4, cells=100)
+		self.assertIsNone(s["desync_tick"])
+		self.assertIsNone(s["half_tick"])
+		self.assertAlmostEqual(s["lyapunov"], 0.0)  # over the whole run
+
+	def test_split_rate_if_independent(self):
+		self.assertAlmostEqual(split_rate_if_independent(["extinct"] * 4, ["extinct"] * 4), 0.0)
+		# half / half on both sides -> split half of the time
+		a = ["extinct", "extinct", "established", "established"]
+		self.assertAlmostEqual(split_rate_if_independent(a, a[::-1]), 0.5)
+
+	def test_baseline_grid_starts_identical(self):
+		for use_nn in (False, True):
+			with self.subTest(use_nn=use_nn):
+				params = dict(
+					width=30, height=30, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=8,
+					food_respawn_rate=0.012, num_agents=60, num_apples=150, num_oranges=150,
+					num_walls=10, use_nn=use_nn, seed=3
+				)
+				g1, g3 = Grid(**params), Grid(**params)
+				g3.rng.seed(BASELINE_SEED_OFFSET + 3)
+				self.assertEqual(grid_difference(g1, g3), 0)
+				if use_nn:
+					# initial networks are identical and follow the reseeded RNG
+					self.assertTrue(np.array_equal(g1.agents[0].nn.W1, g3.agents[0].nn.W1))
+					self.assertIs(g3.agents[0].nn.rng, g3.rng)
+				for _ in range(30):
+					for g in (g1, g3):
+						g.move_agent()
+						g.respawn_food()
+				self.assertGreater(grid_difference(g1, g3), 0)
+
+
 class PopulationStatsTest(unittest.TestCase):
 
 	def test_established(self):
@@ -203,6 +265,18 @@ class PopulationStatsTest(unittest.TestCase):
 		# ticks without agents are left out of the energy-per-agent mean
 		self.assertAlmostEqual(s["mean_energy_per_agent"], 30 / 4)
 
+	def test_event_rates(self):
+		series = {key: [0, 0, 0] for key in SERIES}
+		series["acted"] = [0, 10, 30]
+		series["fights"] = [0, 2, 6]
+		series["food"] = [0, 50, 150]
+		rates = event_rates(series, start=1)
+		# total events / total agent-ticks
+		self.assertAlmostEqual(rates["rate_fights"], 8 / 40)
+		self.assertAlmostEqual(rates["rate_food"], 200 / 40)
+		self.assertAlmostEqual(rates["rate_births"], 0)
+		self.assertTrue(np.isnan(event_rates(series, start=3)["rate_fights"]))  # no agent-ticks
+
 
 class ResultsTest(unittest.TestCase):
 
@@ -218,7 +292,7 @@ class ResultsTest(unittest.TestCase):
 				mock.patch("environmental_abm.plt.get_backend", return_value="inline"), \
 				mock.patch("environmental_abm.plt.show") as show:
 			results = main_simulation(
-				num_runs=runs, num_ticks=ticks, num_prtrb_agents=2, init_seed=5, cutoff=0.1,
+				num_runs=runs, num_ticks=ticks, num_prtrb_agents=2, init_seed=5,
 				final_render=False, lyapunov_final_render=False, name="test", results_dir=root, **params
 			)
 			self.assertEqual(show.call_count, runs)
@@ -229,17 +303,28 @@ class ResultsTest(unittest.TestCase):
 				self.assertEqual(json.load(f)["num_ticks"], ticks)
 			with open(os.path.join(out, "summary.txt")) as f:
 				summary = f.read()
-			for section in ("PARAMETERS LIST", "DETERMINISTIC CHECK", "REGIME SUMMARY", "POPULATION SUMMARY"):
+			for section in ("PARAMETERS LIST", "DETERMINISTIC CHECK", "DIVERGENCE COMPARISON", "REGIME SUMMARY",
+							"POPULATION SUMMARY", "Outcome agreement (grid 1 / baseline)"):
 				self.assertIn(section, summary)
 
 			with open(os.path.join(out, "runs.csv")) as f:
 				rows = list(csv.DictReader(f))
 			self.assertEqual([(r["run"], r["grid"]) for r in rows], [("1", "1"), ("1", "2"), ("2", "1"), ("2", "2")])
+			for key in ("desync_tick", "baseline_d_late", "rate_fights", "baseline_outcome"):
+				self.assertIn(key, rows[0])
 
 			series = np.load(os.path.join(out, "timeseries.npz"))
 			self.assertEqual(series["d"].shape, (runs, ticks + 1))
 			self.assertEqual(series["population"].shape, (runs, 2, ticks + 1))
 			self.assertEqual(series["energy"].shape, (runs, 2, ticks + 1))
+			for key in SERIES:
+				self.assertEqual(series[key].shape, (runs, 2, ticks + 1), key)
+			self.assertEqual(series["baseline_d"].shape, (runs, ticks + 1))
+			self.assertEqual(series["baseline_population"].shape, (runs, ticks + 1))
+			# tick 0 has no events, and the saved counters keep the energy budget
+			self.assertEqual(series["acted"][:, :, 0].sum(), 0)
+			budget = series["food"] - series["metabolism"] - series["reproduction"] - series["residual"]
+			np.testing.assert_allclose(np.diff(series["energy"], axis=2), budget[:, :, 1:], atol=1e-2)
 			# the saved series must agree with the per-run table
 			for r in rows:
 				self.assertEqual(series["population"][int(r["run"]) - 1, int(r["grid"]) - 1, -1], int(r["final_population"]))

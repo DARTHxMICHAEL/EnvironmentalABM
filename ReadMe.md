@@ -29,7 +29,7 @@ where $F$ is food eaten, $A$ the number of agents that acted, $P$ the number of 
 - **Vision:** 8 rays, each with range 8. Each ray returns $[R, G, B, r/8]$ for the first object it hits, giving a 32-value input vector.
 - **Network:** $32 \to 16 \to 8$ with
   $$\mathbf{y} = W_2 \tanh(W_1 \mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2, \qquad \text{move} = \arg\max_k y_k$$
-- **Inheritance:** each weight comes from either parent with probability 0.5 (uniform crossover). Then each weight mutates with probability 0.1: $w \leftarrow w + \mathcal{N}(0, 0.05^2)$.
+- **Inheritance:** each weight comes from either parent with probability 0.5 (uniform crossover). Then each weight mutates with probability 0.1: $w \leftarrow w + \mathcal{N}(0, 0.05^2)$. Mutations draw from the grid's RNG, so siblings mutate independently.
 
 ## Analysis
 
@@ -47,11 +47,18 @@ d(t) = \frac{1}{WH} \sum_{i,j} \delta_{ij}, \qquad
 \end{cases}
 $$
 
-**Lyapunov exponent:** a linear fit over the first $\max(10,\ \text{cutoff} \cdot T)$ ticks:
+**Divergence timing.** Each grid draws all of its randomness (move order, random moves, food spawns, fight ties) from a single RNG. The perturbation stays latent, only visible in the perturbed agents' energy, until the first event it changes: a fight, a death, or a different number of children. From that tick on, the two grids consume random numbers differently, food spawns and moves differ across the whole grid, and $d(t)$ jumps by orders of magnitude in one tick. It then rises to its saturation level instead of growing exponentially. Each run reports:
+- the *desync tick*, the first tick at which at least 10 cells differ
+- the *half-saturation tick* $t_{1/2}$, the first tick with $d(t) \ge d_\infty / 2$, where $d_\infty$ is the baseline pair's mean distance after burn-in
+- the finite-time Lyapunov exponent over the rise only:
 
 $$
-d(t) \approx d_0 e^{\lambda t} \quad\Rightarrow\quad \log d(t) \approx \log d_0 + \lambda t
+\lambda = \frac{1}{t_{1/2}} \log \frac{d(t_{1/2})}{d(0)}
 $$
+
+  Because of the jump, $\lambda$ mostly reflects how long the perturbation stays latent, not an exponential growth rate.
+
+**Baseline (null model).** With `baseline=True`, each run also simulates a third grid. It starts identical to grid 1 but draws from a different RNG stream. Its distance to grid 1, $d_{13}(t)$, is what two runs that share only their initial state look like. If the perturbed pair ends as far apart as the baseline pair, and grid 1 / grid 2 outcomes split about as often as independent fates would, then the perturbation has the same effect as re-seeding.
 
 **Shannon entropy:** computed over coarse-grained cell states (empty, wall, apple, orange, and agent × sex × high/low energy). The model reports $\Delta H = |H_2 - H_1|$ at the final tick.
 
@@ -70,7 +77,9 @@ $$
 - *declined*: $0 < N < N_0$
 - *extinct*: $N = 0$, reported with the extinction tick
 
-The summary counts outcomes per grid and how often grid 1 and grid 2 end with the same outcome. Averages of population, total energy $E$ and energy per agent $E/N$ (over the same window as $r$ and CV) pool the established grids of both grids. A table lists every run and grid with final and peak $N$ and $E$.
+The summary counts outcomes per grid and how often grid 1 and grid 2 (and grid 1 and the baseline) end with the same outcome. It also prints the split rate expected if the two grids' fates were independent: $1 - \sum_o p_1(o)\, p_2(o)$, with $p_i(o)$ the share of runs where grid $i$ ends with outcome $o$. Averages of population, total energy $E$ and energy per agent $E/N$ (over the same window as $r$ and CV) pool the established grids of both grids. A table lists every run and grid with final and peak $N$ and $E$.
+
+**Event rates**, per agent and tick over the same window: food energy eaten, fights, matings, failed matings, births and starvation deaths. Each rate is total events divided by total agent-ticks. Fights, matings (2 parents each) and starvation are the only ways agents die, so they show where the population's turnover comes from.
 
 Results are averaged over `num_runs` trials. Before the trials start, a determinism check confirms that two runs from the same seed give identical grids.
 
@@ -92,7 +101,7 @@ The script runs three experiments one after another:
 2. Neural agents in the near-critical regime
 3. Random agents under the same constraints as experiment 2
 
-Settings are at the bottom of the file: `grid_params`, `num_runs`, `num_ticks`, `num_prtrb_agents`, `init_seed` and `cutoff`.
+Settings are at the bottom of the file: `grid_params`, `num_runs`, `num_ticks`, `num_prtrb_agents`, `init_seed` and `baseline`. The baseline grid adds about 50% to the run time; `baseline=False` skips it.
 
 Each experiment saves its output to `results/<timestamp>_<name>/`:
 
@@ -100,9 +109,9 @@ Each experiment saves its output to `results/<timestamp>_<name>/`:
 |---|---|
 | `summary.txt` | everything printed: parameters, checks and summaries |
 | `params.json` | experiment parameters |
-| `runs.csv` | per-run, per-grid stats: outcome, λ, ΔH, population and energy |
-| `timeseries.npz` | $d(t)$, population and total energy at every tick |
-| `plots/` | $d(t)$ plot for each run, with both populations |
+| `runs.csv` | per-run, per-grid stats: outcome, λ, desync and half-saturation ticks, late distances, ΔH, population, energy, event rates, baseline outcome |
+| `timeseries.npz` | per tick (index = tick): `d`; for both grids, shape (runs, 2, ticks + 1): `population`, `energy`, `sex1` (agents of sex 1), `food_items` and the event counters `acted`, `starved`, `fights`, `matings`, `failed_matings`, `births`, `food`, `metabolism`, `reproduction`, `residual`; with the baseline also `baseline_d` and `baseline_population` |
+| `plots/` | $d(t)$ plot for each run (perturbed and baseline), with both populations |
 | `states/` | initial and final grid snapshots of every run, always saved |
 
 Pass `results_dir=None` to `main_simulation` to save nothing.
@@ -128,7 +137,7 @@ Or run a single setup. With `final_render=False, lyapunov_final_render=False`, o
 from environmental_abm import main_simulation
 
 main_simulation(
-    num_runs=10, num_ticks=4000, num_prtrb_agents=2, init_seed=123, cutoff=0.015,
+    num_runs=10, num_ticks=4000, num_prtrb_agents=2, init_seed=123, baseline=True,
     final_render=False, lyapunov_final_render=False,
     width=100, height=100, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=2,
     food_respawn_rate=0.012, num_agents=120, num_apples=900, num_oranges=900,

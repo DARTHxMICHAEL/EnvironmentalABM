@@ -20,8 +20,17 @@ TICK_STATS = (
 	"food", "metabolism", "reproduction", "residual"
 )
 
+# counters reported as per-agent rates, see event_rates
+RATE_STATS = ("food", "fights", "matings", "failed_matings", "births", "starved")
+
+# per-tick series saved for both grids of every run, see record
+SERIES = ("population", "energy", "sex1", "food_items") + TICK_STATS
+
 # final-tick outcome of a grid, see population_stats
 OUTCOMES = ("established", "declined", "extinct")
+
+# RNG seed offset of the baseline grid, see compare_grids
+BASELINE_SEED_OFFSET = 1_000_003
 
 
 class Results:
@@ -32,7 +41,7 @@ class Results:
 		summary.txt     printed parameters, checks and summaries
 		params.json     experiment parameters
 		runs.csv        population/energy stats, one row per run and grid
-		timeseries.npz  d(t), population and total energy per tick for every run
+		timeseries.npz  d(t), population, energy and event counters per tick for every run
 		plots/          d(t) divergence plots
 		states/         rendered grid states
 
@@ -182,6 +191,9 @@ class Grid:
 
 	def cross_mutate(self, nn1, nn2):
 		child = copy.deepcopy(nn1)
+		# deepcopy also copied nn1's RNG - without this every child of nn1 would mutate
+		# from the same frozen RNG state, and siblings would get identical mutations
+		child.rng = self.rng
 
 		for attr in ["W1", "W2"]:
 			parent_matrix = getattr(nn2, attr)
@@ -669,17 +681,80 @@ def population_stats(pop, energy, initial_agents, start):
 	}
 
 
-def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, results=None, **grid_params):
+def divergence_stats(d, d_ref, cells):
 	"""
-	Estimate the maximal finite-time Lyapunov exponent (FTLE) via lockstep evolution,
-	compute Shannon entropy difference, and calculate basic regime stability metrics.
+	Timing of the divergence d(t) between two grids.
+
+	d     : d(t) at ticks 0..T
+	d_ref : saturation level - the late distance of two independently driven grids
+	cells : number of grid cells
+
+	Each grid draws all randomness from one RNG, so the first event the perturbation changes
+	(a fight, a death, a different number of children) shifts every later draw. From that tick on
+	food spawns and moves differ across the whole grid, and d(t) jumps by orders of magnitude in
+	a single tick instead of growing exponentially.
+
+	desync_tick : first tick with at least 10 cells differing (None if it never happens)
+	half_tick   : first tick with d >= d_ref / 2 (None if it never happens)
+	lyapunov    : finite-time exponent ln(d(t_end) / d(0)) / t_end over the rise only,
+	              t_end = half_tick, or T if d never gets there
+	"""
+	d = np.asarray(d)
+	desync = np.flatnonzero(d >= 10 / cells)
+	half = np.flatnonzero(d >= d_ref / 2) if d_ref > 0 else []
+	desync_tick = int(desync[0]) if len(desync) else None
+	half_tick = int(half[0]) if len(half) and half[0] > 0 else None
+	t_end = half_tick or len(d) - 1
+	return {
+		"desync_tick": desync_tick,
+		"half_tick": half_tick,
+		"lyapunov": float(np.log(d[t_end] / d[0]) / t_end),
+	}
+
+
+def event_rates(series, start):
+	"""
+	Events per agent and tick over ticks start..T, from the per-tick counters of one grid.
+	Ratio of sums: total events / total agent-ticks ("acted"), so busy ticks weigh more.
+	food is energy eaten per agent and tick, the others are counts.
+	"""
+	acted = np.sum(series["acted"][start:])
+	return {
+		f"rate_{key}": float(np.sum(series[key][start:]) / acted) if acted else float("nan")
+		for key in RATE_STATS
+	}
+
+
+def new_series():
+	return {key: [] for key in SERIES}
+
+
+def record(g, series):
+	series["population"].append(len(g.agents))
+	series["energy"].append(g.total_energy())
+	series["sex1"].append(sum(a.sex == 1 for a in g.agents))
+	series["food_items"].append(len(g.food_items))
+	for key in TICK_STATS:
+		series[key].append(g.stats[key])
+
+
+def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, g3=None, results=None, **grid_params):
+	"""
+	Run two nearly identical grids in lockstep and measure how they diverge, compute the Shannon
+	entropy difference, and calculate basic regime stability metrics.
 
 	Methodology
 	-----------
-	- Lyapunov exponent λ is estimated from the early exponential divergence:
-		d(t) ≈ d0 * exp(λ t)
-		log d(t) ≈ log d0 + λ t
-	  using a fixed cutoff fraction of total ticks for regression.
+	- Divergence: d(t) is the phase-space distance between g1 and g2 (grid_difference).
+	  The perturbation stays latent until the first event it changes, then the grids' RNG
+	  streams desynchronize and d(t) jumps (see divergence_stats). Reported are the desync tick,
+	  the tick at which d(t) reaches half its saturation level, and the finite-time Lyapunov
+	  exponent over that rise.
+
+	- Baseline: g3 starts identical to g1 but draws from a different RNG stream. d_13(t) is
+	  the divergence of two runs that share nothing but the initial state. If the perturbed pair
+	  ends up as far apart as the baseline pair, the perturbation is indistinguishable from
+	  re-seeding.
 
 	- Shannon entropy difference ΔH is computed at the final tick as a macroscopic measure
 	  of structural divergence between the two grids. Agents are categorized by sex and energy
@@ -703,8 +778,8 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 		If True, renders initial and final grid states. Default False.
 	trial : int, optional
 		Trial index for display purposes. Default 1.
-	cutoff : float, optional
-		Fraction of total ticks used for Lyapunov regression. Default 0.2.
+	g3 : Grid or None, optional
+		Baseline grid: same initial state as g1, different RNG stream. None skips the baseline.
 	**grid_params : dict
 		Additional grid parameters required for entropy computation and population metrics.
 
@@ -713,13 +788,15 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 	dict
 		Dictionary containing the following metrics:
 		- "lyap" : float
-			Estimated finite-time Lyapunov exponent.
-		- "diffs" : list of float
-			Phase-space distances d(t) trajectory.
+			Finite-time Lyapunov exponent over the rise of d(t).
+		- "desync_tick", "half_tick" : int or None
+			See divergence_stats.
+		- "d_late", "baseline_d_late" : float
+			Mean d(t) after burn-in of the perturbed pair and of the baseline pair (nan without g3).
+		- "diffs", "baseline_diffs" : list of float
+			d(t) of the perturbed pair and of the baseline pair (None without g3).
 		- "shannon_diff" : float
 			Shannon entropy difference ΔH between grids at final tick.
-		- "cutoff_pct" : float
-			Actual cutoff fraction (%) used for regression.
 		- "r" : float
 			Estimated mean log-growth rate of population (after burn-in).
 		- "cv" : float
@@ -731,19 +808,27 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 		- "final_population" : int
 			Population size at the final tick.
 		- "grids" : list of dict
-			population_stats of grid 1 and grid 2.
-		- "populations", "energies" : list of list
-			Population size and total agent energy of both grids at ticks 0..T.
+			population_stats and event_rates of grid 1 and grid 2.
+		- "baseline" : dict or None
+			population_stats of g3.
+		- "series" : list of dict
+			Per-tick series of grid 1 and grid 2 (keys in SERIES) at ticks 0..T.
+		- "baseline_population" : list of int or None
+			Population of g3 at ticks 0..T.
 	"""
 	results = results or Results(None, root=None)
 	run = f"run{trial+1:02d}"
+	cells = g1.width * g1.height
 
-	diffs = []
-	pops = ([len(g1.agents)], [len(g2.agents)])
-	energies = ([g1.total_energy()], [g2.total_energy()])
+	series = (new_series(), new_series())
+	for g, s in zip((g1, g2), series):
+		record(g, s)
+	diffs = [max(grid_difference(g1, g2), 1e-12)]
 
-	d0 = max(grid_difference(g1, g2), 1e-12)
-	diffs.append(d0)
+	if g3 is not None:
+		baseline_pop = [len(g3.agents)]
+		baseline_energy = [g3.total_energy()]
+		baseline_diffs = [max(grid_difference(g1, g3), 1e-12)]
 
 	def render_states(stage):
 		# saved whenever there is an output folder, displayed only with render=True
@@ -758,32 +843,31 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 	render_states("initial")
 
 	for t in range(num_ticks):
-		g1.move_agent()
-		g1.respawn_food()
+		for g, s in zip((g1, g2), series):
+			g.move_agent()
+			g.respawn_food()
+			record(g, s)
+		diffs.append(max(grid_difference(g1, g2), 1e-12))
 
-		g2.move_agent()
-		g2.respawn_food()
+		if g3 is not None:
+			g3.move_agent()
+			g3.respawn_food()
+			baseline_pop.append(len(g3.agents))
+			baseline_energy.append(g3.total_energy())
+			baseline_diffs.append(max(grid_difference(g1, g3), 1e-12))
 
-		d = max(grid_difference(g1, g2), 1e-12)
-		diffs.append(d)
-		for g, pop, energy in zip((g1, g2), pops, energies):
-			pop.append(len(g.agents))
-			energy.append(g.total_energy())
-
+	pops = [s["population"] for s in series]
 	pop_history = pops[0][1:]  # grid 1, ticks 1..T
 
 	render_states("final")
 
-	# -- lyap --
-	log_diffs = np.log(diffs)
-	cutoff_idx = max(10, int(cutoff * num_ticks))
-	cutoff_pct = (cutoff_idx / num_ticks) * 100
+	burn_frac = 0.3
+	start = int(burn_frac * num_ticks)
 
-	x = np.arange(cutoff_idx)
-	y = log_diffs[:cutoff_idx]
-
-	slope, _ = np.polyfit(x, y, 1)
-	lyap = slope
+	# --- divergence ---
+	d_late = float(np.mean(diffs[start + 1:]))
+	baseline_d_late = float(np.mean(baseline_diffs[start + 1:])) if g3 is not None else float("nan")
+	divergence = divergence_stats(diffs, baseline_d_late if g3 is not None else d_late, cells)
 
 	# --- entropy ---
 	g1_H = shannon_entropy(g1, grid_params['min_child_energy'])
@@ -793,7 +877,6 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 	# --- regime metrics ---
 	pop_history = np.array(pop_history)
 	g = g1
-	burn_frac = 0.3
 
 	if pop_history[-1] == 0:
 		viable = 0
@@ -804,7 +887,6 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 
 	pop_history_safe = np.maximum(pop_history, 1)
 
-	start = int(burn_frac * num_ticks)
 	t_vals = np.arange(start, num_ticks)
 
 	logN = np.log(pop_history_safe[start:])
@@ -817,27 +899,41 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 	stdN = np.std(pop_history[start:])
 	cv = stdN / meanN if meanN > 0 else float("inf")
 
-	# --- population and energy stats of both grids (same window as r and CV) ---
+	# --- population, energy and event stats of all grids (same window as r and CV) ---
 	grid_stats = [
-		population_stats(pop, energy, grid_params['num_agents'], start + 1)
-		for pop, energy in zip(pops, energies)
+		{**population_stats(s["population"], s["energy"], grid_params['num_agents'], start + 1),
+		 **event_rates(s, start + 1)}
+		for s in series
 	]
+	baseline_stats = None
+	if g3 is not None:
+		baseline_stats = population_stats(baseline_pop, baseline_energy, grid_params['num_agents'], start + 1)
+
+	def tick(t):
+		return "never" if t is None else str(t)
 
 	results.log(
 		f"[Run {trial+1:02d}] "
-		f"λ = {lyap:.5f} | "
-		f"cutoff = {cutoff_pct:.2f}% | "
-		f"ΔH = {shannon_diff:.5f} | "
+		f"λ = {divergence['lyapunov']:.5f} | "
+		f"desync @ {tick(divergence['desync_tick'])} | "
+		f"d½ @ {tick(divergence['half_tick'])} | "
+		f"d_late = {d_late:.3f}"
+		+ (f" (baseline {baseline_d_late:.3f})" if g3 is not None else "")
+		+ f" | ΔH = {shannon_diff:.5f} | "
 		f"grid 1: {grid_stats[0]['outcome']}, grid 2: {grid_stats[1]['outcome']}"
+		+ (f", baseline: {baseline_stats['outcome']}" if g3 is not None else "")
 	)
 
 	# --- divergence trajectory plot, with both populations on a second axis ---
 	fig, ax = plt.subplots(figsize=(7, 4))
-	ax.plot(range(len(diffs)), diffs, label='d(t) trajectory')
-	ax.axvline(x=cutoff_idx, color='red', linestyle='--', label=f'Cutoff ({cutoff_pct:.1f}%)')
+	ax.plot(range(len(diffs)), diffs, label='d(t) perturbed')
+	if g3 is not None:
+		ax.plot(range(len(baseline_diffs)), baseline_diffs, color='tab:gray', linewidth=1, label='d(t) baseline (reseeded)')
+	if divergence["desync_tick"] is not None:
+		ax.axvline(x=divergence["desync_tick"], color='red', linestyle='--', label=f'Desync (tick {divergence["desync_tick"]})')
 	ax.set_xlabel('Tick')
 	ax.set_ylabel('Phase-space distance d(t)')
-	ax.set_title(f'Lyapunov Divergence Run {trial+1}')
+	ax.set_title(f'Divergence Run {trial+1}')
 	ax.grid(True)
 
 	ax_pop = ax.twinx()
@@ -851,26 +947,38 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, resul
 	results.show(fig, "plots", f"divergence_{run}")
 
 	return {
-		"lyap": lyap,
+		"lyap": divergence["lyapunov"],
+		"desync_tick": divergence["desync_tick"],
+		"half_tick": divergence["half_tick"],
+		"d_late": d_late,
+		"baseline_d_late": baseline_d_late,
 		"diffs": diffs,
+		"baseline_diffs": baseline_diffs if g3 is not None else None,
 		"shannon_diff": shannon_diff,
-		"cutoff_pct": cutoff_pct,
 		"r": r,
 		"cv": cv,
 		"viable": viable,
 		"population_preserved": population_preserved,
 		"final_population": int(pop_history[-1]),
 		"grids": grid_stats,
-		"populations": pops,
-		"energies": energies
+		"baseline": baseline_stats,
+		"series": series,
+		"baseline_population": baseline_pop if g3 is not None else None,
 	}
 
 
-def population_summary(runs, results):
-	"""
-	Print outcome counts, pooled population/energy stats and a per-run table.
+def split_rate_if_independent(a, b):
+	"""Chance that two grids end with different outcomes if their fates were independent."""
+	pa, pb = Counter(a), Counter(b)
+	return 1 - sum(pa[o] * pb[o] for o in OUTCOMES) / (len(a) * len(b))
 
-	runs : list of (run, grid, stats) with stats from population_stats.
+
+def population_summary(runs, results, baseline=None):
+	"""
+	Print outcome counts, pooled population/energy stats, event rates and a per-run table.
+
+	runs     : list of (run, grid, stats) with stats from population_stats and event_rates.
+	baseline : {run: population_stats} of the reseeded baseline grid, or None.
 	Means pool the established grids of both grid 1 and grid 2.
 	"""
 	log = results.log
@@ -879,12 +987,21 @@ def population_summary(runs, results):
 	for grid in (1, 2):
 		counts = Counter(s["outcome"] for _, g, s in runs if g == grid)
 		log(f"{f'Outcomes (grid {grid})':45s}: " + ", ".join(f"{counts[o]} {o}" for o in OUTCOMES))
+	if baseline:
+		counts = Counter(s["outcome"] for s in baseline.values())
+		log(f"{'Outcomes (baseline, reseeded grid 1)':45s}: " + ", ".join(f"{counts[o]} {o}" for o in OUTCOMES))
 
 	outcomes = {}
 	for run, grid, s in runs:
 		outcomes.setdefault(run, {})[grid] = s["outcome"]
 	same = sum(o[1] == o[2] for o in outcomes.values())
 	log(f"{'Outcome agreement (grid 1 / grid 2)':45s}: {same} same, {len(outcomes) - same} split")
+	# if the perturbed split rate is close to this, the perturbation acts like a new seed
+	expected = split_rate_if_independent([o[1] for o in outcomes.values()], [o[2] for o in outcomes.values()])
+	log(f"{'  split rate if fates were independent':45s}: {expected:.2f} (observed {(len(outcomes) - same) / len(outcomes):.2f})")
+	if baseline:
+		same_b = sum(outcomes[run][1] == s["outcome"] for run, s in baseline.items())
+		log(f"{'Outcome agreement (grid 1 / baseline)':45s}: {same_b} same, {len(baseline) - same_b} split")
 
 	extinction_ticks = [s["extinction_tick"] for _, _, s in runs if s["outcome"] == "extinct"]
 	if extinction_ticks:
@@ -903,6 +1020,12 @@ def population_summary(runs, results):
 		values = [s[key] for s in established]
 		if values:
 			log(f"  {label:43s}: {np.mean(values):.1f} ± {np.std(values):.1f}")
+	if established:
+		log("  Per agent and tick (after burn-in):")
+		for key in RATE_STATS:
+			values = [s[f"rate_{key}"] for s in established]
+			label = "food energy eaten" if key == "food" else key.replace("_", " ")
+			log(f"    {label:41s}: {np.mean(values):.5f} ± {np.std(values):.5f}")
 
 	# per-run table, * marks the largest value of the column (no mark if every row ties)
 	maxima = {}
@@ -930,9 +1053,9 @@ def population_summary(runs, results):
 	log("* largest value in the column")
 
 
-def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=True, lyapunov_final_render=True, num_trials=30, cutoff=0.2, results=None, **grid_params):
+def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=True, lyapunov_final_render=True, num_trials=30, baseline=True, results=None, **grid_params):
 	"""
-	Compare two nearly identical grid simulations to estimate the Lyapunov exponent,
+	Compare two nearly identical grid simulations to measure their divergence,
 	Shannon entropy and aggregate regime statistics over multiple trials.
 
 	Parameters
@@ -943,28 +1066,23 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 		Number of agents to be perturbated (by adding energy).
 	seed : int, optional
 		Random seed ensuring deterministic setup. Default is 123.
-	cutoff : float, optional
-		Fraction of ticks used for Lyapunov regression. Default is 0.2.
+	baseline : bool, optional
+		Also run a third grid per trial, identical to grid 1 but with a different RNG stream
+		(see main_analysis). Costs 50% more run time. Default is True.
 
 	Returns
 	-------
 	mean_lambda : float
-		Estimated Lyapunov exponent of the system.
+		Mean finite-time Lyapunov exponent over the rise of d(t).
 	mean_H : float
 		Shannon entropy difference between two grids.
 	"""
 	results = results or Results(None, root=None)
 	log = results.log
 
-	lambdas = []
-	shannon_diffs = []
-	cutoffs = []
-	r_vals = []
-	cv_vals = []
-	viable_flags = []
-	pop_preserved_flags = []
-	grid_runs = []  # (run, grid, population_stats)
-	series = {"d": [], "population": [], "energy": []}
+	run_results = []
+	grid_runs = []  # (run, grid, population_stats + event_rates)
+	baseline_runs = {}  # run -> population_stats of the baseline grid
 
 	for trial in range(num_trials):
 		g1 = Grid(**grid_params, seed=seed + trial)
@@ -977,61 +1095,78 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 			for agent in perturbed:
 				agent.energy += g2.min_child_energy
 
-		result = main_analysis(
-			g1, g2, num_ticks, lyapunov_final_render, trial, cutoff, results=results, **grid_params
-		)
+		g3 = None
+		if baseline:
+			# same initial state as g1, then a different RNG stream. Reseeded in place:
+			# the initial networks hold a reference to this RNG object
+			g3 = Grid(**grid_params, seed=seed + trial)
+			g3.rng.seed(BASELINE_SEED_OFFSET + seed + trial)
 
-		lambdas.append(result["lyap"])
-		shannon_diffs.append(result["shannon_diff"])
-		cutoffs.append(result["cutoff_pct"])
-		r_vals.append(result["r"])
-		cv_vals.append(result["cv"])
-		viable_flags.append(result["viable"])
-		pop_preserved_flags.append(result["population_preserved"])
+		result = main_analysis(
+			g1, g2, num_ticks, lyapunov_final_render, trial, g3, results=results, **grid_params
+		)
+		run_results.append(result)
 		for grid, stats in enumerate(result["grids"], start=1):
 			grid_runs.append((trial + 1, grid, stats))
-		series["d"].append(result["diffs"])
-		series["population"].append(result["populations"])
-		series["energy"].append(result["energies"])
+		if baseline:
+			baseline_runs[trial + 1] = result["baseline"]
 
-	# --- lyap & entropy ---
+	def column(key):
+		return [res[key] for res in run_results]
+
+	# --- divergence & entropy ---
+	lambdas = column("lyap")
 	mean_lambda = np.mean(lambdas)
-	std_lambda = np.std(lambdas)
-	mean_H = np.mean(shannon_diffs)
-	std_H = np.std(shannon_diffs)
+	mean_H = np.mean(column("shannon_diff"))
 
 	log("\n----- SUMMARY -----")
-	log(f"Lyapunov exponent     : {mean_lambda:.6f} ± {std_lambda:.6f}")
-	log(f"Shannon entropy ΔH    : {mean_H:.6f} ± {std_H:.6f}")
+	log(f"{'Lyapunov exponent (rise of d(t))':37s}: {mean_lambda:.6f} ± {np.std(lambdas):.6f}")
+	for label, key in (("Desync tick", "desync_tick"), ("Half-saturation tick", "half_tick")):
+		ticks = [t for t in column(key) if t is not None]
+		reached = f"{np.median(ticks):.0f} (range {min(ticks)}-{max(ticks)})" if ticks else "-"
+		log(f"{label + ', median':37s}: {reached}, reached in {len(ticks)}/{num_trials} runs")
+	log(f"{'Late distance d (after burn-in)':37s}: {np.mean(column('d_late')):.4f} ± {np.std(column('d_late')):.4f}")
+	if baseline:
+		log(f"{'  baseline (reseeded, unperturbed)':37s}: {np.mean(column('baseline_d_late')):.4f} ± {np.std(column('baseline_d_late')):.4f}")
+	log(f"{'Shannon entropy ΔH':37s}: {mean_H:.6f} ± {np.std(column('shannon_diff')):.6f}")
 
 	# --- regime stats ---
-	mean_r = np.mean(r_vals)
-	std_r = np.std(r_vals)
+	r_vals = column("r")
+	cv_vals = column("cv")
 	valid_cvs = [cv for cv in cv_vals if np.isfinite(cv)]
-	mean_cv = np.mean(valid_cvs)
-	viability_rate = np.mean(viable_flags)
-	preservation_rate = np.mean(pop_preserved_flags)
 
 	log("\n----- REGIME SUMMARY -----")
-	log(f"{'Mean log population growth rate':45s}: {mean_r:.6f}")
-	log(f"{'Standard deviation of log growth rate':45s}: {std_r:.6f}")
+	log(f"{'Mean log population growth rate':45s}: {np.mean(r_vals):.6f}")
+	log(f"{'Standard deviation of log growth rate':45s}: {np.std(r_vals):.6f}")
 	# runs extinct before the burn-in ends have no defined CV and are left out
-	log(f"{'Mean coefficient of variation':45s}: {mean_cv:.6f} ({len(valid_cvs)}/{len(cv_vals)} runs)")
-	log(f"{'Viability preservation probability':45s}: {viability_rate:.3f}")
-	log(f"{'Population preservation probability':45s}: {preservation_rate:.3f}")
+	log(f"{'Mean coefficient of variation':45s}: {np.mean(valid_cvs):.6f} ({len(valid_cvs)}/{len(cv_vals)} runs)")
+	log(f"{'Viability preservation probability':45s}: {np.mean(column('viable')):.3f}")
+	log(f"{'Population preservation probability':45s}: {np.mean(column('population_preserved')):.3f}")
 
-	population_summary(grid_runs, results)
+	population_summary(grid_runs, results, baseline_runs or None)
 
+	run_columns = ("lyap", "desync_tick", "half_tick", "d_late", "baseline_d_late", "shannon_diff")
 	results.save_csv("runs.csv", [
-		{"run": run, "grid": grid, "lyapunov": lambdas[run - 1], "shannon_diff": shannon_diffs[run - 1], **stats}
+		{
+			"run": run, "grid": grid,
+			**{("lyapunov" if key == "lyap" else key): run_results[run - 1][key] for key in run_columns},
+			**stats,
+			**({"baseline_outcome": baseline_runs[run]["outcome"]} if baseline else {}),
+		}
 		for run, grid, stats in grid_runs
 	])
-	results.save_arrays(
-		"timeseries.npz",
-		d=np.array(series["d"]),                    # (runs, ticks + 1)
-		population=np.array(series["population"]),  # (runs, 2 grids, ticks + 1)
-		energy=np.array(series["energy"]),          # (runs, 2 grids, ticks + 1)
-	)
+
+	def stacked(key):
+		# (runs, 2 grids, ticks + 1); counts as int32, energies as float32 to keep the file small
+		values = np.array([[s[key] for s in res["series"]] for res in run_results])
+		return values.astype(np.float32 if values.dtype.kind == "f" else np.int32)
+
+	arrays = {key: stacked(key) for key in SERIES}
+	arrays["d"] = np.array(column("diffs"))  # (runs, ticks + 1)
+	if baseline:
+		arrays["baseline_d"] = np.array(column("baseline_diffs"))                 # (runs, ticks + 1)
+		arrays["baseline_population"] = np.array(column("baseline_population"))  # (runs, ticks + 1)
+	results.save_arrays("timeseries.npz", **arrays)
 
 	return mean_lambda, mean_H
 
@@ -1096,7 +1231,7 @@ def check_determinism(num_ticks, seed, debug_render=False, final_render=True, re
 	return True
 
 
-def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
+def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=True, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
 	"""
 	Execute the main experiment pipeline.
 
@@ -1112,6 +1247,8 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, de
 		Number of agents to be perturbated (by adding energy).
 	init_seed : int, optional
 		Random seed to ensure deterministic behavior.
+	baseline : bool, optional
+		Run a reseeded, unperturbed copy of grid 1 per run as a null model (see compare_grids).
 	name : str, optional
 		Experiment name, used for the output folder.
 	results_dir : str or None, optional
@@ -1126,7 +1263,7 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, de
 	log = results.log
 	results.save_json("params.json", {
 		"name": name, "num_runs": num_runs, "num_ticks": num_ticks, "num_prtrb_agents": num_prtrb_agents,
-		"init_seed": init_seed, "cutoff": cutoff, **grid_params
+		"init_seed": init_seed, "baseline": baseline, **grid_params
 	})
 
 	log("\n----- PARAMETERS LIST -----")
@@ -1134,6 +1271,7 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, de
 	log(f"Simulation ticks            : {num_ticks}")
 	log(f"Perturbed agents            : {num_prtrb_agents}")
 	log(f"Initial random seed         : {init_seed}")
+	log(f"Baseline (reseeded) grid    : {'yes' if baseline else 'no'}")
 	log(f"Grid width                  : {grid_params['width']}")
 	log(f"Grid height                 : {grid_params['height']}")
 	log(f"Metabolic cost              : {grid_params['metabolic_cost']}")
@@ -1154,8 +1292,8 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, de
 	if not is_deterministic:
 		raise RuntimeError("Simulation environment is non-deterministic.")
 
-	log("\n----- LYAPUNOV EXPONENT COMPARISON -----")
-	compare_grids(num_ticks, num_prtrb_agents, init_seed, final_render, lyapunov_final_render, num_runs, cutoff, results=results, **grid_params)
+	log("\n----- DIVERGENCE COMPARISON -----")
+	compare_grids(num_ticks, num_prtrb_agents, init_seed, final_render, lyapunov_final_render, num_runs, baseline, results=results, **grid_params)
 	log("--------------------------------------")
 	return results
 
@@ -1165,7 +1303,7 @@ if __name__ == "__main__":
 	num_ticks=15000
 	num_prtrb_agents=2
 	init_seed=123
-	cutoff=0.015
+	baseline=True  # reseeded third grid per run, +50% run time
 
 
 	"""
@@ -1207,7 +1345,7 @@ if __name__ == "__main__":
 		num_ticks=num_ticks,
 		num_prtrb_agents=num_prtrb_agents,
 		init_seed=init_seed,
-		cutoff=cutoff,
+		baseline=baseline,
 		**grid_params
 	)
 
@@ -1245,7 +1383,7 @@ if __name__ == "__main__":
 		num_ticks=num_ticks,
 		num_prtrb_agents=num_prtrb_agents,
 		init_seed=init_seed,
-		cutoff=cutoff,
+		baseline=baseline,
 		**grid_params
 	)
 
@@ -1287,6 +1425,6 @@ if __name__ == "__main__":
 		num_ticks=num_ticks,
 		num_prtrb_agents=num_prtrb_agents,
 		init_seed=init_seed,
-		cutoff=cutoff,
+		baseline=baseline,
 		**grid_params
 	)
