@@ -2,9 +2,12 @@ import random
 import matplotlib.pyplot as plt
 import numpy as np
 import copy
+import csv
+import json
 import os
 import math
 from collections import Counter
+from datetime import datetime
 
 directions = [
 	(-1, 0), (1, 0), (0, -1), (0, 1),  # left, right, down, up
@@ -16,6 +19,66 @@ TICK_STATS = (
 	"acted", "starved", "fights", "matings", "failed_matings", "births",
 	"food", "metabolism", "reproduction", "residual"
 )
+
+# final-tick outcome of a grid, see population_stats
+OUTCOMES = ("established", "declined", "extinct")
+
+
+class Results:
+	"""
+	Output of one experiment. Everything printed through log() and every figure passed to
+	show() is also saved under <root>/<timestamp>_<name>/:
+
+		summary.txt     printed parameters, checks and summaries
+		params.json     experiment parameters
+		runs.csv        population/energy stats, one row per run and grid
+		timeseries.npz  d(t), population and total energy per tick for every run
+		plots/          d(t) divergence plots
+		states/         rendered grid states
+
+	With root=None nothing is saved.
+	"""
+
+	def __init__(self, name, root="results"):
+		self.dir = None
+		if root is not None:
+			stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+			self.dir = os.path.join(root, f"{stamp}_{name}")
+			for subdir in ("plots", "states"):
+				os.makedirs(os.path.join(self.dir, subdir), exist_ok=True)
+
+	def path(self, *parts):
+		return os.path.join(self.dir, *parts)
+
+	def log(self, text=""):
+		print(text)
+		if self.dir:
+			with open(self.path("summary.txt"), "a") as f:
+				f.write(text + "\n")
+
+	def show(self, fig, subdir=None, name=None, display=True):
+		# save (with a name and an output folder), then show unless display=False
+		if self.dir and name:
+			fig.savefig(self.path(subdir, name + ".png"), dpi=100, bbox_inches="tight")
+		if display and plt.get_backend().lower() != "agg":  # agg has no display, the saved file is enough
+			plt.show()
+		plt.close(fig)
+
+	def save_json(self, name, data):
+		if self.dir:
+			with open(self.path(name), "w") as f:
+				json.dump(data, f, indent=2)
+
+	def save_csv(self, name, rows):
+		if self.dir and rows:
+			with open(self.path(name), "w", newline="") as f:
+				writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+				writer.writeheader()
+				writer.writerows(rows)
+
+	def save_arrays(self, name, **arrays):
+		if self.dir:
+			np.savez_compressed(self.path(name), **arrays)
 
 class Agent:
 	def __init__(self, x, y, sex, color, energy=10):
@@ -429,7 +492,11 @@ class Grid:
 			self.place_object(food)
 			self.food_items.append(food)
 
-	def render(self):
+	def total_energy(self):
+		return sum(agent.energy for agent in self.agents)
+
+	def render(self, label=None):
+		"""Draw the grid and return the figure (shown/saved by the caller)."""
 		color_grid = np.ones((self.height, self.width, 3))  # white background
 
 		for wall in self.walls:
@@ -444,21 +511,21 @@ class Grid:
 		num_apples = sum(isinstance(f, Apple) for f in self.food_items)
 		num_oranges = sum(isinstance(f, Orange) for f in self.food_items)
 
-		combined_energy = sum(agent.energy for agent in self.agents)
-
 		title = (
 			f"Agents: {len(self.agents)} | "
-			f"Total agents energy: {combined_energy:.2f} | "
+			f"Total agents energy: {self.total_energy():.2f} | "
 			f"Apples: {num_apples} | "
 			f"Oranges: {num_oranges} | "
 			f"Walls: {len(self.walls)}"
 		)
+		if label:
+			title = f"{label}\n{title}"
 
-		plt.figure(figsize=(10, 10))
-		plt.imshow(color_grid, interpolation='nearest')
-		plt.title(title)
-		plt.axis('off')
-		plt.show()
+		fig, ax = plt.subplots(figsize=(10, 10))
+		ax.imshow(color_grid, interpolation='nearest')
+		ax.set_title(title)
+		ax.axis('off')
+		return fig
 
 
 def shannon_entropy(grid, energy_eps=6):
@@ -556,7 +623,53 @@ def grid_difference(g1, g2):
 	return diff / total
 
 
-def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, **grid_params):
+def population_stats(pop, energy, initial_agents, start):
+	"""
+	Outcome and population/energy statistics of one grid.
+
+	Parameters
+	----------
+	pop, energy : sequence
+		Population size and total agent energy at ticks 0..T (index = tick).
+	initial_agents : int
+		Starting population.
+	start : int
+		First tick of the post burn-in window used for the mean values.
+
+	The outcome is decided at the final tick: extinct (N = 0), declined (0 < N < initial)
+	or established (N >= initial, the same as "population preserved").
+	"""
+	pop = np.asarray(pop)
+	energy = np.asarray(energy, dtype=float)
+	final_population = int(pop[-1])
+
+	if final_population == 0:
+		outcome = "extinct"
+	elif final_population < initial_agents:
+		outcome = "declined"
+	else:
+		outcome = "established"
+
+	late_pop, late_energy = pop[start:], energy[start:]
+	alive = late_pop > 0
+
+	return {
+		"outcome": outcome,
+		"extinction_tick": int(np.argmax(pop == 0)) if outcome == "extinct" else None,
+		"final_population": final_population,
+		"final_energy": float(energy[-1]),
+		"final_energy_per_agent": float(energy[-1] / final_population) if final_population else float("nan"),
+		"peak_population": int(pop.max()),
+		"peak_population_tick": int(pop.argmax()),
+		"peak_energy": float(energy.max()),
+		"peak_energy_tick": int(energy.argmax()),
+		"mean_population": float(late_pop.mean()),
+		"mean_energy": float(late_energy.mean()),
+		"mean_energy_per_agent": float(np.mean(late_energy[alive] / late_pop[alive])) if alive.any() else float("nan"),
+	}
+
+
+def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, results=None, **grid_params):
 	"""
 	Estimate the maximal finite-time Lyapunov exponent (FTLE) via lockstep evolution,
 	compute Shannon entropy difference, and calculate basic regime stability metrics.
@@ -617,18 +730,32 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, **gri
 			True if final population >= initial population.
 		- "final_population" : int
 			Population size at the final tick.
+		- "grids" : list of dict
+			population_stats of grid 1 and grid 2.
+		- "populations", "energies" : list of list
+			Population size and total agent energy of both grids at ticks 0..T.
 	"""
+	results = results or Results(None, root=None)
+	run = f"run{trial+1:02d}"
+
 	diffs = []
-	pop_history = []
+	pops = ([len(g1.agents)], [len(g2.agents)])
+	energies = ([g1.total_energy()], [g2.total_energy()])
 
 	d0 = max(grid_difference(g1, g2), 1e-12)
 	diffs.append(d0)
 
-	if render:
-		g1.render()
-		print("Grid 1 - Initial Shannon entropy:", shannon_entropy(g1, grid_params['min_child_energy']))
-		g2.render()
-		print("Grid 2 - Initial Shannon entropy:", shannon_entropy(g2, grid_params['min_child_energy']))
+	def render_states(stage):
+		# saved whenever there is an output folder, displayed only with render=True
+		if not (render or results.dir):
+			return
+		for i, g in enumerate((g1, g2), start=1):
+			fig = g.render(f"Run {trial+1:02d} - grid {i} - {stage}")
+			results.show(fig, "states", f"{run}_grid{i}_{stage}", display=render)
+			if render:
+				results.log(f"Grid {i} - {stage.capitalize()} Shannon entropy: {shannon_entropy(g, grid_params['min_child_energy'])}")
+
+	render_states("initial")
 
 	for t in range(num_ticks):
 		g1.move_agent()
@@ -639,13 +766,13 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, **gri
 
 		d = max(grid_difference(g1, g2), 1e-12)
 		diffs.append(d)
-		pop_history.append(len(g1.agents))
+		for g, pop, energy in zip((g1, g2), pops, energies):
+			pop.append(len(g.agents))
+			energy.append(g.total_energy())
 
-	if render:
-		g1.render()
-		print("Grid 1 - Final Shannon entropy:", shannon_entropy(g1, grid_params['min_child_energy']))
-		g2.render()
-		print("Grid 2 - Final Shannon entropy:", shannon_entropy(g2, grid_params['min_child_energy']))
+	pop_history = pops[0][1:]  # grid 1, ticks 1..T
+
+	render_states("final")
 
 	# -- lyap --
 	log_diffs = np.log(diffs)
@@ -690,23 +817,38 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, **gri
 	stdN = np.std(pop_history[start:])
 	cv = stdN / meanN if meanN > 0 else float("inf")
 
-	print(
+	# --- population and energy stats of both grids (same window as r and CV) ---
+	grid_stats = [
+		population_stats(pop, energy, grid_params['num_agents'], start + 1)
+		for pop, energy in zip(pops, energies)
+	]
+
+	results.log(
 		f"[Run {trial+1:02d}] "
 		f"λ = {lyap:.5f} | "
 		f"cutoff = {cutoff_pct:.2f}% | "
-		f"ΔH = {shannon_diff:.5f}"
+		f"ΔH = {shannon_diff:.5f} | "
+		f"grid 1: {grid_stats[0]['outcome']}, grid 2: {grid_stats[1]['outcome']}"
 	)
 
-	# --- divergence trajectory plot ---
-	plt.figure(figsize=(6, 4))
-	plt.plot(range(len(diffs)), diffs, label='d(t) trajectory')
-	plt.axvline(x=cutoff_idx, color='red', linestyle='--', label=f'Cutoff ({cutoff_pct:.1f}%)')
-	plt.xlabel('Tick')
-	plt.ylabel('Phase-space distance d(t)')
-	plt.title(f'Lyapunov Divergence Run {trial+1}')
-	plt.legend()
-	plt.grid(True)
-	plt.show()
+	# --- divergence trajectory plot, with both populations on a second axis ---
+	fig, ax = plt.subplots(figsize=(7, 4))
+	ax.plot(range(len(diffs)), diffs, label='d(t) trajectory')
+	ax.axvline(x=cutoff_idx, color='red', linestyle='--', label=f'Cutoff ({cutoff_pct:.1f}%)')
+	ax.set_xlabel('Tick')
+	ax.set_ylabel('Phase-space distance d(t)')
+	ax.set_title(f'Lyapunov Divergence Run {trial+1}')
+	ax.grid(True)
+
+	ax_pop = ax.twinx()
+	ax_pop.plot(pops[0], color='tab:green', alpha=0.6, linewidth=1, label='N(t) grid 1')
+	ax_pop.plot(pops[1], color='tab:purple', alpha=0.6, linewidth=1, linestyle='--', label='N(t) grid 2')
+	ax_pop.set_ylabel('Population N(t)')
+
+	handles, labels = ax.get_legend_handles_labels()
+	pop_handles, pop_labels = ax_pop.get_legend_handles_labels()
+	ax.legend(handles + pop_handles, labels + pop_labels, fontsize='small')
+	results.show(fig, "plots", f"divergence_{run}")
 
 	return {
 		"lyap": lyap,
@@ -717,11 +859,78 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, cutoff=0.2, **gri
 		"cv": cv,
 		"viable": viable,
 		"population_preserved": population_preserved,
-		"final_population": int(pop_history[-1])
+		"final_population": int(pop_history[-1]),
+		"grids": grid_stats,
+		"populations": pops,
+		"energies": energies
 	}
 
 
-def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=True, lyapunov_final_render=True, num_trials=30, cutoff=0.2, **grid_params):
+def population_summary(runs, results):
+	"""
+	Print outcome counts, pooled population/energy stats and a per-run table.
+
+	runs : list of (run, grid, stats) with stats from population_stats.
+	Means pool the established grids of both grid 1 and grid 2.
+	"""
+	log = results.log
+	log("\n----- POPULATION SUMMARY -----")
+
+	for grid in (1, 2):
+		counts = Counter(s["outcome"] for _, g, s in runs if g == grid)
+		log(f"{f'Outcomes (grid {grid})':45s}: " + ", ".join(f"{counts[o]} {o}" for o in OUTCOMES))
+
+	outcomes = {}
+	for run, grid, s in runs:
+		outcomes.setdefault(run, {})[grid] = s["outcome"]
+	same = sum(o[1] == o[2] for o in outcomes.values())
+	log(f"{'Outcome agreement (grid 1 / grid 2)':45s}: {same} same, {len(outcomes) - same} split")
+
+	extinction_ticks = [s["extinction_tick"] for _, _, s in runs if s["outcome"] == "extinct"]
+	if extinction_ticks:
+		log(f"{'Median extinction tick':45s}: {np.median(extinction_ticks):.0f} ({len(extinction_ticks)} grids)")
+
+	established = [s for _, _, s in runs if s["outcome"] == "established"]
+	log(f"Established grids, both grids pooled (n={len(established)}), mean ± sd:" if established
+		else "Established grids                            : none")
+	for label, key in (
+		("Population (after burn-in)", "mean_population"),
+		("Total energy (after burn-in)", "mean_energy"),
+		("Energy per agent (after burn-in)", "mean_energy_per_agent"),
+		("Peak population", "peak_population"),
+		("Peak total energy", "peak_energy"),
+	):
+		values = [s[key] for s in established]
+		if values:
+			log(f"  {label:43s}: {np.mean(values):.1f} ± {np.std(values):.1f}")
+
+	# per-run table, * marks the largest value of the column (no mark if every row ties)
+	maxima = {}
+	for key in ("final_population", "peak_population", "final_energy", "peak_energy"):
+		values = [s[key] for _, _, s in runs]
+		if values.count(max(values)) < len(values):
+			maxima[key] = max(values)
+
+	def cell(s, key, tick_key=None, fmt="{:.0f}"):
+		text = fmt.format(s[key])
+		if tick_key:
+			text += f" ({s[tick_key]})"
+		return text + ("*" if s[key] == maxima.get(key) else " ")
+
+	log(f"\n{'run':>3} {'grid':>4}  {'outcome':<16}{'N_final':>9}{'N_peak (tick)':>16}{'E_final':>11}{'E_peak (tick)':>18}{'E/N_final':>11}")
+	for run, grid, s in runs:
+		outcome = f"extinct @{s['extinction_tick']}" if s["outcome"] == "extinct" else s["outcome"]
+		per_agent = f"{s['final_energy_per_agent']:.1f}" if s["final_population"] else "-"
+		log(
+			f"{run:>3} {grid:>4}  {outcome:<16}"
+			f"{cell(s, 'final_population'):>9}{cell(s, 'peak_population', 'peak_population_tick'):>16}"
+			f"{cell(s, 'final_energy'):>11}{cell(s, 'peak_energy', 'peak_energy_tick'):>18}"
+			f"{per_agent:>10}"
+		)
+	log("* largest value in the column")
+
+
+def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=True, lyapunov_final_render=True, num_trials=30, cutoff=0.2, results=None, **grid_params):
 	"""
 	Compare two nearly identical grid simulations to estimate the Lyapunov exponent,
 	Shannon entropy and aggregate regime statistics over multiple trials.
@@ -744,6 +953,9 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	mean_H : float
 		Shannon entropy difference between two grids.
 	"""
+	results = results or Results(None, root=None)
+	log = results.log
+
 	lambdas = []
 	shannon_diffs = []
 	cutoffs = []
@@ -751,6 +963,8 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	cv_vals = []
 	viable_flags = []
 	pop_preserved_flags = []
+	grid_runs = []  # (run, grid, population_stats)
+	series = {"d": [], "population": [], "energy": []}
 
 	for trial in range(num_trials):
 		g1 = Grid(**grid_params, seed=seed + trial)
@@ -764,7 +978,7 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 				agent.energy += g2.min_child_energy
 
 		result = main_analysis(
-			g1, g2, num_ticks, lyapunov_final_render, trial, cutoff, **grid_params
+			g1, g2, num_ticks, lyapunov_final_render, trial, cutoff, results=results, **grid_params
 		)
 
 		lambdas.append(result["lyap"])
@@ -774,6 +988,11 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 		cv_vals.append(result["cv"])
 		viable_flags.append(result["viable"])
 		pop_preserved_flags.append(result["population_preserved"])
+		for grid, stats in enumerate(result["grids"], start=1):
+			grid_runs.append((trial + 1, grid, stats))
+		series["d"].append(result["diffs"])
+		series["population"].append(result["populations"])
+		series["energy"].append(result["energies"])
 
 	# --- lyap & entropy ---
 	mean_lambda = np.mean(lambdas)
@@ -781,9 +1000,9 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	mean_H = np.mean(shannon_diffs)
 	std_H = np.std(shannon_diffs)
 
-	print("\n----- SUMMARY -----")
-	print(f"Lyapunov exponent     : {mean_lambda:.6f} ± {std_lambda:.6f}")
-	print(f"Shannon entropy ΔH    : {mean_H:.6f} ± {std_H:.6f}")
+	log("\n----- SUMMARY -----")
+	log(f"Lyapunov exponent     : {mean_lambda:.6f} ± {std_lambda:.6f}")
+	log(f"Shannon entropy ΔH    : {mean_H:.6f} ± {std_H:.6f}")
 
 	# --- regime stats ---
 	mean_r = np.mean(r_vals)
@@ -793,18 +1012,31 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	viability_rate = np.mean(viable_flags)
 	preservation_rate = np.mean(pop_preserved_flags)
 
-	print("\n----- REGIME SUMMARY -----")
-	print(f"{'Mean log population growth rate':45s}: {mean_r:.6f}")
-	print(f"{'Standard deviation of log growth rate':45s}: {std_r:.6f}")
+	log("\n----- REGIME SUMMARY -----")
+	log(f"{'Mean log population growth rate':45s}: {mean_r:.6f}")
+	log(f"{'Standard deviation of log growth rate':45s}: {std_r:.6f}")
 	# runs extinct before the burn-in ends have no defined CV and are left out
-	print(f"{'Mean coefficient of variation':45s}: {mean_cv:.6f} ({len(valid_cvs)}/{len(cv_vals)} runs)")
-	print(f"{'Viability preservation probability':45s}: {viability_rate:.3f}")
-	print(f"{'Population preservation probability':45s}: {preservation_rate:.3f}")
+	log(f"{'Mean coefficient of variation':45s}: {mean_cv:.6f} ({len(valid_cvs)}/{len(cv_vals)} runs)")
+	log(f"{'Viability preservation probability':45s}: {viability_rate:.3f}")
+	log(f"{'Population preservation probability':45s}: {preservation_rate:.3f}")
+
+	population_summary(grid_runs, results)
+
+	results.save_csv("runs.csv", [
+		{"run": run, "grid": grid, "lyapunov": lambdas[run - 1], "shannon_diff": shannon_diffs[run - 1], **stats}
+		for run, grid, stats in grid_runs
+	])
+	results.save_arrays(
+		"timeseries.npz",
+		d=np.array(series["d"]),                    # (runs, ticks + 1)
+		population=np.array(series["population"]),  # (runs, 2 grids, ticks + 1)
+		energy=np.array(series["energy"]),          # (runs, 2 grids, ticks + 1)
+	)
 
 	return mean_lambda, mean_H
 
 
-def check_determinism(num_ticks, seed, debug_render=False, final_render=True, **grid_params):
+def check_determinism(num_ticks, seed, debug_render=False, final_render=True, results=None, **grid_params):
 	"""
 	Verify whether the simulation environment is fully deterministic.
 
@@ -816,51 +1048,55 @@ def check_determinism(num_ticks, seed, debug_render=False, final_render=True, **
 	bool
 		True if deterministic, False otherwise.
 	"""
-	print("\n----- DETERMINISTIC CHECK -----")
+	results = results or Results(None, root=None)
+	log = results.log
+	log("\n----- DETERMINISTIC CHECK -----")
 
 	g1 = Grid(**grid_params, seed=seed)
 	g2 = Grid(**grid_params, seed=seed)
 
-	if final_render == True:
-		g1.render()
-		print("Grid 1 - Initial Shannon entropy:", shannon_entropy(g1, grid_params['min_child_energy']))
-		g2.render()
-		print("Grid 2 - Initial Shannon entropy:", shannon_entropy(g2, grid_params['min_child_energy']))
+	def render_states(stage):
+		# saved whenever there is an output folder, displayed only with final_render=True
+		if not (final_render or results.dir):
+			return
+		for i, g in enumerate((g1, g2), start=1):
+			fig = g.render(f"Determinism check - grid {i} - {stage}")
+			results.show(fig, "states", f"determinism_grid{i}_{stage}", display=final_render)
+			if final_render:
+				log(f"Grid {i} - {stage.capitalize()} Shannon entropy: {shannon_entropy(g, grid_params['min_child_energy'])}")
+
+	render_states("initial")
 
 	for t in range(num_ticks):
 		g1.move_agent()
 		g1.respawn_food()
 
 		if debug_render == True:
-			g1.render()
-			g2.render()
+			results.show(g1.render(f"Determinism check - grid 1 - tick {t}"))
+			results.show(g2.render(f"Determinism check - grid 2 - tick {t}"))
 
 		g2.move_agent()
 		g2.respawn_food()
 
-	if final_render == True:
-		g1.render()
-		print("Grid 1 - Final Shannon entropy:", shannon_entropy(g1, grid_params['min_child_energy']))
-		g2.render()
-		print("Grid 2 - Final Shannon entropy:", shannon_entropy(g2, grid_params['min_child_energy']))
+	render_states("final")
 
 	diff = grid_difference(g1, g2)
 
-	print(
+	log(
 		"Difference between two grids with identical initial conditions "
 		f"(expected 0.0): {diff}"
 	)
 
 	if diff > 0:
-		print("Determinism check FAILED.")
+		log("Determinism check FAILED.")
 		return False
 
-	print("Determinism check PASSED.")
-	print("--------------------------------------")
+	log("Determinism check PASSED.")
+	log("--------------------------------------")
 	return True
 
 
-def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=False, lyapunov_final_render=True, **grid_params):
+def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
 	"""
 	Execute the main experiment pipeline.
 
@@ -876,39 +1112,52 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, cutoff, de
 		Number of agents to be perturbated (by adding energy).
 	init_seed : int, optional
 		Random seed to ensure deterministic behavior.
+	name : str, optional
+		Experiment name, used for the output folder.
+	results_dir : str or None, optional
+		Output is saved to <results_dir>/<timestamp>_<name>/ (see Results). None saves nothing.
 
 	Returns
 	-------
-	tuple of (Grid, float)
-		Final grid state and estimated Lyapunov exponent.
+	Results
+		Output of the experiment; Results.dir is the output folder.
 	"""
+	results = Results(name, root=results_dir)
+	log = results.log
+	results.save_json("params.json", {
+		"name": name, "num_runs": num_runs, "num_ticks": num_ticks, "num_prtrb_agents": num_prtrb_agents,
+		"init_seed": init_seed, "cutoff": cutoff, **grid_params
+	})
 
-	print("\n----- PARAMETERS LIST -----")
-	print(f"Number of runs              : {num_runs}")
-	print(f"Simulation ticks            : {num_ticks}")
-	print(f"Perturbed agents            : {num_prtrb_agents}")
-	print(f"Initial random seed         : {init_seed}")
-	print(f"Grid width                  : {grid_params['width']}")
-	print(f"Grid height                 : {grid_params['height']}")
-	print(f"Metabolic cost              : {grid_params['metabolic_cost']}")
-	print(f"Minimum child energy        : {grid_params['min_child_energy']}")
-	print(f"Reproduction cost           : {grid_params['reproduction_cost']}")
-	print(f"Food respawn rate           : {grid_params['food_respawn_rate']}")
-	print(f"Initial number of agents    : {grid_params['num_agents']}")
-	print(f"Initial number of apples    : {grid_params['num_apples']}")
-	print(f"Initial number of oranges   : {grid_params['num_oranges']}")
-	print(f"Number of walls             : {grid_params['num_walls']}")
-	print(f"Agent decision mechanism    : {'Neural Network' if grid_params['use_nn'] else 'Random'}")
-	print("--------------------------------------")
+	log("\n----- PARAMETERS LIST -----")
+	log(f"Number of runs              : {num_runs}")
+	log(f"Simulation ticks            : {num_ticks}")
+	log(f"Perturbed agents            : {num_prtrb_agents}")
+	log(f"Initial random seed         : {init_seed}")
+	log(f"Grid width                  : {grid_params['width']}")
+	log(f"Grid height                 : {grid_params['height']}")
+	log(f"Metabolic cost              : {grid_params['metabolic_cost']}")
+	log(f"Minimum child energy        : {grid_params['min_child_energy']}")
+	log(f"Reproduction cost           : {grid_params['reproduction_cost']}")
+	log(f"Food respawn rate           : {grid_params['food_respawn_rate']}")
+	log(f"Initial number of agents    : {grid_params['num_agents']}")
+	log(f"Initial number of apples    : {grid_params['num_apples']}")
+	log(f"Initial number of oranges   : {grid_params['num_oranges']}")
+	log(f"Number of walls             : {grid_params['num_walls']}")
+	log(f"Agent decision mechanism    : {'Neural Network' if grid_params['use_nn'] else 'Random'}")
+	if results.dir:
+		log(f"Output folder               : {results.dir}")
+	log("--------------------------------------")
 
-	is_deterministic = check_determinism(num_ticks=num_ticks,seed=init_seed,debug_render=debug_render,final_render=final_render,**grid_params)
+	is_deterministic = check_determinism(num_ticks=num_ticks,seed=init_seed,debug_render=debug_render,final_render=final_render,results=results,**grid_params)
 
 	if not is_deterministic:
 		raise RuntimeError("Simulation environment is non-deterministic.")
 
-	print("\n----- LYAPUNOV EXPONENT COMPARISON -----")
-	lyap = compare_grids(num_ticks, num_prtrb_agents, init_seed, final_render, lyapunov_final_render, num_runs, cutoff, **grid_params)
-	print("--------------------------------------")
+	log("\n----- LYAPUNOV EXPONENT COMPARISON -----")
+	compare_grids(num_ticks, num_prtrb_agents, init_seed, final_render, lyapunov_final_render, num_runs, cutoff, results=results, **grid_params)
+	log("--------------------------------------")
+	return results
 
 
 if __name__ == "__main__":
@@ -945,14 +1194,15 @@ if __name__ == "__main__":
 		"min_child_energy": 7,
 		"reproduction_cost": 2,
 		"food_respawn_rate": 0.012,
-		"num_agents": 20,
-		"num_apples": 30,
-		"num_oranges": 30,
+		"num_agents": 15,
+		"num_apples": 25,
+		"num_oranges": 25,
 		"num_walls": 60,
 		"use_nn": False
 	}
 
 	main_simulation(
+		name="exp1_random_critical",
 		num_runs=num_runs,
 		num_ticks=num_ticks,
 		num_prtrb_agents=num_prtrb_agents,
@@ -990,6 +1240,7 @@ if __name__ == "__main__":
 	}
 
 	main_simulation(
+		name="exp2_ann_critical",
 		num_runs=num_runs,
 		num_ticks=num_ticks,
 		num_prtrb_agents=num_prtrb_agents,
@@ -1031,6 +1282,7 @@ if __name__ == "__main__":
 	}
 
 	main_simulation(
+		name="exp3_random_ann_params",
 		num_runs=num_runs,
 		num_ticks=num_ticks,
 		num_prtrb_agents=num_prtrb_agents,

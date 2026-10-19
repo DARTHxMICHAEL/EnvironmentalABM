@@ -65,6 +65,13 @@ $$
 - viability: both sexes are present at the end
 - preservation: the final population is at least the initial population
 
+**Population summary**, for both grids. Each grid's outcome is decided at the final tick:
+- *established*: $N \ge N_0$ (the same as preservation)
+- *declined*: $0 < N < N_0$
+- *extinct*: $N = 0$, reported with the extinction tick
+
+The summary counts outcomes per grid and how often grid 1 and grid 2 end with the same outcome. Averages of population, total energy $E$ and energy per agent $E/N$ (over the same window as $r$ and CV) pool the established grids of both grids. A table lists every run and grid with final and peak $N$ and $E$.
+
 Results are averaged over `num_runs` trials. Before the trials start, a determinism check confirms that two runs from the same seed give identical grids.
 
 ## Usage
@@ -87,6 +94,19 @@ The script runs three experiments one after another:
 
 Settings are at the bottom of the file: `grid_params`, `num_runs`, `num_ticks`, `num_prtrb_agents`, `init_seed` and `cutoff`.
 
+Each experiment saves its output to `results/<timestamp>_<name>/`:
+
+| | |
+|---|---|
+| `summary.txt` | everything printed: parameters, checks and summaries |
+| `params.json` | experiment parameters |
+| `runs.csv` | per-run, per-grid stats: outcome, λ, ΔH, population and energy |
+| `timeseries.npz` | $d(t)$, population and total energy at every tick |
+| `plots/` | $d(t)$ plot for each run, with both populations |
+| `states/` | initial and final grid snapshots of every run, always saved |
+
+Pass `results_dir=None` to `main_simulation` to save nothing.
+
 ## Viewing plots
 
 **Jupyter (recommended).** Plots appear in the browser, under the cell that made them. With the venv active:
@@ -102,7 +122,7 @@ If no browser opens, copy the `http://localhost:8888/tree?token=...` link from t
 %run environmental_abm.py
 ```
 
-Or run a single setup. With `final_render=False, lyapunov_final_render=False`, you get only the divergence plot for each run:
+Or run a single setup. With `final_render=False, lyapunov_final_render=False`, only the divergence plots are displayed. The grid snapshots are still saved to `states/`:
 
 ```python
 from environmental_abm import main_simulation
@@ -116,4 +136,4 @@ main_simulation(
 )
 ```
 
-**Plot windows.** Running `python environmental_abm.py` opens each plot in its own window. This needs Tk: install it with `sudo apt install python3-tk` on Ubuntu/Debian. Without Tk, matplotlib shows nothing.
+**Plot windows.** Running `python environmental_abm.py` opens each plot in its own window. This needs Tk: install it with `sudo apt install python3-tk` on Ubuntu/Debian. Without Tk, no windows open, but the plots are still saved to the output folder.

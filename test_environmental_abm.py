@@ -1,6 +1,19 @@
+import contextlib
+import csv
+import io
+import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
-from environmental_abm import Agent, Food, Grid, SimpleNN, Wall, grid_difference
+import matplotlib
+matplotlib.use("Agg")
+import numpy as np
+
+from environmental_abm import (
+	Agent, Food, Grid, SimpleNN, Wall, grid_difference, main_simulation, population_stats
+)
 
 
 def empty_grid(width=10, height=10, **overrides):
@@ -163,6 +176,77 @@ class MatingTest(unittest.TestCase):
 
 		self.assertGreater(failed, 0)
 		self.assertEqual(grid.stats["births"], 0)
+
+
+class PopulationStatsTest(unittest.TestCase):
+
+	def test_established(self):
+		pop = [10, 12, 20, 15, 14]
+		energy = [100, 150, 300, 330, 280]
+		s = population_stats(pop, energy, initial_agents=10, start=2)
+
+		self.assertEqual(s["outcome"], "established")
+		self.assertIsNone(s["extinction_tick"])
+		self.assertEqual((s["peak_population"], s["peak_population_tick"]), (20, 2))
+		self.assertEqual((s["peak_energy"], s["peak_energy_tick"]), (330, 3))
+		self.assertAlmostEqual(s["mean_population"], (20 + 15 + 14) / 3)
+		self.assertAlmostEqual(s["mean_energy_per_agent"], (300 / 20 + 330 / 15 + 280 / 14) / 3)
+		self.assertAlmostEqual(s["final_energy_per_agent"], 20)
+
+	def test_declined_and_extinct(self):
+		self.assertEqual(population_stats([10, 5, 3], [100, 60, 900], 10, 1)["outcome"], "declined")
+
+		s = population_stats([10, 4, 0, 0], [100, 30, 0, 0], initial_agents=10, start=1)
+		self.assertEqual(s["outcome"], "extinct")
+		self.assertEqual(s["extinction_tick"], 2)
+		self.assertTrue(np.isnan(s["final_energy_per_agent"]))
+		# ticks without agents are left out of the energy-per-agent mean
+		self.assertAlmostEqual(s["mean_energy_per_agent"], 30 / 4)
+
+
+class ResultsTest(unittest.TestCase):
+
+	def test_main_simulation_saves_output(self):
+		params = dict(
+			width=20, height=20, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=2,
+			food_respawn_rate=0.012, num_agents=15, num_apples=30, num_oranges=30,
+			num_walls=5, use_nn=False
+		)
+		runs, ticks = 2, 40
+		# render flags off: grid snapshots are saved but not displayed, only d(t) plots are shown
+		with tempfile.TemporaryDirectory() as root, contextlib.redirect_stdout(io.StringIO()), \
+				mock.patch("environmental_abm.plt.get_backend", return_value="inline"), \
+				mock.patch("environmental_abm.plt.show") as show:
+			results = main_simulation(
+				num_runs=runs, num_ticks=ticks, num_prtrb_agents=2, init_seed=5, cutoff=0.1,
+				final_render=False, lyapunov_final_render=False, name="test", results_dir=root, **params
+			)
+			self.assertEqual(show.call_count, runs)
+			out = results.dir
+			self.assertTrue(os.path.basename(out).endswith("_test"))
+
+			with open(os.path.join(out, "params.json")) as f:
+				self.assertEqual(json.load(f)["num_ticks"], ticks)
+			with open(os.path.join(out, "summary.txt")) as f:
+				summary = f.read()
+			for section in ("PARAMETERS LIST", "DETERMINISTIC CHECK", "REGIME SUMMARY", "POPULATION SUMMARY"):
+				self.assertIn(section, summary)
+
+			with open(os.path.join(out, "runs.csv")) as f:
+				rows = list(csv.DictReader(f))
+			self.assertEqual([(r["run"], r["grid"]) for r in rows], [("1", "1"), ("1", "2"), ("2", "1"), ("2", "2")])
+
+			series = np.load(os.path.join(out, "timeseries.npz"))
+			self.assertEqual(series["d"].shape, (runs, ticks + 1))
+			self.assertEqual(series["population"].shape, (runs, 2, ticks + 1))
+			self.assertEqual(series["energy"].shape, (runs, 2, ticks + 1))
+			# the saved series must agree with the per-run table
+			for r in rows:
+				self.assertEqual(series["population"][int(r["run"]) - 1, int(r["grid"]) - 1, -1], int(r["final_population"]))
+
+			self.assertEqual(sorted(os.listdir(os.path.join(out, "plots"))), ["divergence_run01.png", "divergence_run02.png"])
+			# 4 determinism renders + 4 per run (2 grids, initial and final)
+			self.assertEqual(len(os.listdir(os.path.join(out, "states"))), 4 + 4 * runs)
 
 
 if __name__ == "__main__":
