@@ -172,7 +172,24 @@ class SimpleNN:
 
 class Grid:
 	def __init__(self, width, height, metabolic_cost, min_child_energy, reproduction_cost, food_respawn_rate,
-	num_agents, num_apples, num_oranges, num_walls=30, use_nn=False, seed=123):
+	num_agents, num_apples, num_oranges, num_walls=30, use_nn=False, regrowth="empty", food_capacity=None,
+	inheritance="evolve", seed=123):
+		"""
+		regrowth      : "empty"    - floor(food_respawn_rate * empty cells) food items spawn per tick
+		                "logistic" - r * F * (1 - F / food_capacity) items, F = food items on the grid and
+		                             r = food_respawn_rate (stochastically rounded, so small stocks can recover)
+		inheritance   : how children of neural agents get their network
+		                "evolve"      - uniform crossover of the parents, then mutation
+		                "no_mutation" - crossover only, selection acts on the initial variation
+		                "none"        - a fresh random network, no heritability and no adaptation
+		"""
+		if regrowth not in ("empty", "logistic"):
+			raise ValueError(f"unknown regrowth rule: {regrowth}")
+		if regrowth == "logistic" and not food_capacity:
+			raise ValueError("logistic regrowth needs food_capacity")
+		if inheritance not in ("evolve", "no_mutation", "none"):
+			raise ValueError(f"unknown inheritance: {inheritance}")
+
 		self.width = width
 		self.height = height
 		self.metabolic_cost = metabolic_cost
@@ -184,12 +201,20 @@ class Grid:
 		self.food_items = []
 		self.walls = []
 		self.use_nn = use_nn
+		self.regrowth = regrowth
+		self.food_capacity = food_capacity
+		self.inheritance = inheritance
 		self.rng = random.Random(seed)
 		self.stats = dict.fromkeys(TICK_STATS, 0)
 
 		self.populate(num_agents, num_apples, num_oranges, num_walls)
 
-	def cross_mutate(self, nn1, nn2):
+	def child_network(self, nn1, nn2):
+		if self.inheritance == "none":
+			return SimpleNN(self.rng)
+		return self.cross_mutate(nn1, nn2, mutate=self.inheritance == "evolve")
+
+	def cross_mutate(self, nn1, nn2, mutate=True):
 		child = copy.deepcopy(nn1)
 		# deepcopy also copied nn1's RNG - without this every child of nn1 would mutate
 		# from the same frozen RNG state, and siblings would get identical mutations
@@ -205,7 +230,8 @@ class Grid:
 
 			child_matrix[mask] = parent_matrix[mask]
 
-		child.mutate()
+		if mutate:
+			child.mutate()
 		return child
 
 	def get_empty_positions(self):
@@ -353,7 +379,7 @@ class Grid:
 
 			# artificial NN use
 			if self.use_nn:
-				child.nn = self.cross_mutate(agent1.nn, agent2.nn)
+				child.nn = self.child_network(agent1.nn, agent2.nn)
 
 			self.place_object(child)
 			self.agents.append(child)
@@ -494,7 +520,13 @@ class Grid:
 		if not empty:
 			return
 
-		n = int(len(empty) * self.food_respawn_rate)
+		if self.regrowth == "logistic":
+			stock = len(self.food_items)
+			expected = self.food_respawn_rate * stock * (1 - stock / self.food_capacity)
+			n = int(expected) + (self.rng.random() < expected - int(expected)) if expected > 0 else 0
+			n = min(n, len(empty))
+		else:
+			n = int(len(empty) * self.food_respawn_rate)
 		for x, y in self.rng.sample(empty, n):
 			if self.rng.random() < 0.6:
 				food = Apple(x, y)
@@ -1283,6 +1315,11 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 	log(f"Initial number of oranges   : {grid_params['num_oranges']}")
 	log(f"Number of walls             : {grid_params['num_walls']}")
 	log(f"Agent decision mechanism    : {'Neural Network' if grid_params['use_nn'] else 'Random'}")
+	regrowth = grid_params.get('regrowth', 'empty')
+	log(f"Food regrowth               : {regrowth}"
+		+ (f" (capacity {grid_params['food_capacity']})" if regrowth == "logistic" else ""))
+	if grid_params['use_nn']:
+		log(f"Network inheritance         : {grid_params.get('inheritance', 'evolve')}")
 	if results.dir:
 		log(f"Output folder               : {results.dir}")
 	log("--------------------------------------")

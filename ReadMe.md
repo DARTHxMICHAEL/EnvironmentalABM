@@ -6,7 +6,9 @@ A grid-based agent-based model where agents forage, fight and reproduce. The mod
 
 - **World:** a `width × height` grid with walls (green), apples (red, $+5$ energy), oranges (orange, $+10$ energy) and agents (blue, with sex $\in \{0, 1\}$).
 - **Each tick:** every living agent acts once, in random order, unless another agent removes it before its turn. Each agent pays a metabolic cost $c$ and dies when $E \le 0$. It then tries to move one cell in one of 8 directions. Walls and the grid edges block movement, and an agent only moves into a cell that is empty after the interaction (food eaten, fight loser removed). Children act from the next tick on.
-- **Food:** stepping onto food adds its energy. Each tick, $\lfloor \rho \cdot N_{\text{empty}} \rfloor$ new food items spawn: 60% apples, 40% oranges.
+- **Food:** stepping onto food adds its energy. Each tick, new food items spawn on random empty cells: 60% apples, 40% oranges. How many depends on `regrowth`:
+  - `"empty"` (default): $\lfloor \rho \cdot N_{\text{empty}} \rfloor$. Eating food frees cells, so grazing the stock down *raises* supply.
+  - `"logistic"`: $\rho F (1 - F/K)$, with $F$ the food items on the grid and $K$ = `food_capacity`, rounded stochastically. Grazing below $K/2$ *lowers* supply, and $F = 0$ is permanent.
 - **Same-sex encounter (fight):** the agent with more energy wins and takes the loser's energy, $E_w \leftarrow E_w + E_l$. The loser is removed.
 - **Opposite-sex encounter (mating):** each parent pays the reproduction cost $c_r$. The remaining energy is split evenly among the children, who are placed on free cells within radius 2 of the parents' midpoint. The parents are removed:
 
@@ -29,7 +31,7 @@ where $F$ is food eaten, $A$ the number of agents that acted, $P$ the number of 
 - **Vision:** 8 rays, each with range 8. Each ray returns $[R, G, B, r/8]$ for the first object it hits, giving a 32-value input vector.
 - **Network:** $32 \to 16 \to 8$ with
   $$\mathbf{y} = W_2 \tanh(W_1 \mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2, \qquad \text{move} = \arg\max_k y_k$$
-- **Inheritance:** each weight comes from either parent with probability 0.5 (uniform crossover). Then each weight mutates with probability 0.1: $w \leftarrow w + \mathcal{N}(0, 0.05^2)$. Mutations draw from the grid's RNG, so siblings mutate independently.
+- **Inheritance:** each weight comes from either parent with probability 0.5 (uniform crossover). Then each weight mutates with probability 0.1: $w \leftarrow w + \mathcal{N}(0, 0.05^2)$. Mutations draw from the grid's RNG, so siblings mutate independently. `inheritance="no_mutation"` keeps only the crossover, and `inheritance="none"` gives every child a fresh random network, so nothing can adapt.
 
 ## Analysis
 
@@ -115,6 +117,15 @@ Each experiment saves its output to `results/<timestamp>_<name>/`:
 | `states/` | initial and final grid snapshots of every run, always saved |
 
 Pass `results_dir=None` to `main_simulation` to save nothing.
+
+### Regrowth pilot
+
+`pilot_regrowth.py` asks whether adaptation helps or hurts the population depending on how food regrows. It compares world A (`regrowth="empty"`) with world B (`regrowth="logistic"`, $K = 5000$, $\rho = 0.065$). The two are calibrated so that random agents settle at the same population (about 550) and food stock (about 2480) in both. In world B, that stock is the logistic peak. Both worlds start pre-stocked with 8000 food items, so the start-up phase is the same. Conditions: random agents, evolving networks, crossover only (B only) and no inheritance. It runs 12 jobs in parallel (about 5–6 h on 6 cores / 12 threads) and writes `report.txt`:
+
+```bash
+nohup python pilot_regrowth.py > pilot.log 2>&1 &
+python pilot_regrowth.py --report results/pilot_<timestamp>   # re-run the report
+```
 
 ## Viewing plots
 

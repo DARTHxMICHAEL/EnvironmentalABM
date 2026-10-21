@@ -196,6 +196,51 @@ class InheritanceTest(unittest.TestCase):
 		self.assertFalse(np.array_equal(children[1].W1, children[2].W1))
 
 
+	def test_inheritance_modes(self):
+		for inheritance, same_as_parents in (("evolve", False), ("no_mutation", True), ("none", False)):
+			with self.subTest(inheritance=inheritance):
+				grid = empty_grid(use_nn=True, inheritance=inheritance)
+				a = add_agent(grid, 5, 5, sex=0, energy=30)
+				b = add_agent(grid, 5, 6, sex=1, energy=30)
+				b.nn.W1[:], b.nn.W2[:] = a.nn.W1, a.nn.W2  # identical parents: crossover is a no-op
+
+				grid.meet(a, b)
+				child = next(x for x in grid.agents if x.alive)
+				self.assertEqual(np.array_equal(child.nn.W1, a.nn.W1), same_as_parents)
+
+	def test_invalid_options(self):
+		for overrides in ({"inheritance": "lamarck"}, {"regrowth": "linear"}, {"regrowth": "logistic"}):
+			with self.subTest(**overrides), self.assertRaises(ValueError):
+				empty_grid(**overrides)
+
+
+class RegrowthTest(unittest.TestCase):
+
+	def test_logistic_regrowth(self):
+		# r * F * (1 - F / K) = 0.5 * 20 * (1 - 20 / 100) = 8 new items
+		grid = empty_grid(regrowth="logistic", food_capacity=100, food_respawn_rate=0.5, num_apples=20)
+		grid.respawn_food()
+		self.assertEqual(len(grid.food_items), 28)
+		assert_consistent(self, grid)
+
+	def test_logistic_regrowth_bounds(self):
+		# no food left -> none ever comes back; at or above capacity -> no growth
+		for apples, expected in ((0, 0), (100, 100)):
+			with self.subTest(apples=apples):
+				grid = empty_grid(
+					width=20, height=20, regrowth="logistic", food_capacity=100, food_respawn_rate=0.5, num_apples=apples
+				)
+				grid.respawn_food()
+				self.assertEqual(len(grid.food_items), expected)
+
+	def test_logistic_regrowth_rounds_stochastically(self):
+		# expected 0.5 * 1 * (1 - 1 / 100) = 0.495 items per tick, so a single item can still regrow
+		grid = empty_grid(regrowth="logistic", food_capacity=100, food_respawn_rate=0.5, num_apples=1)
+		for _ in range(10):
+			grid.respawn_food()
+		self.assertGreater(len(grid.food_items), 1)
+
+
 class DivergenceTest(unittest.TestCase):
 
 	def test_divergence_stats(self):
