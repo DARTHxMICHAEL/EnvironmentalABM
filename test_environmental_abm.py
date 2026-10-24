@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import os
+import random
 import tempfile
 import unittest
 from unittest import mock
@@ -12,7 +13,7 @@ matplotlib.use("Agg")
 import numpy as np
 
 from environmental_abm import (
-	BASELINE_SEED_OFFSET, SERIES, Agent, Food, Grid, SimpleNN, Wall, divergence_stats,
+	BASELINE_SEED_OFFSET, SERIES, Agent, Food, Grid, SimpleNN, Snapshots, Wall, divergence_stats,
 	event_rates, grid_difference, main_simulation, population_stats, split_rate_if_independent
 )
 
@@ -94,6 +95,9 @@ class TickTest(unittest.TestCase):
 					s = grid.stats
 					expected = s["food"] - s["metabolism"] - s["reproduction"] - s["residual"]
 					self.assertAlmostEqual(total_energy(grid) - before, expected, delta=1e-6)
+					# apples give 5, oranges 10
+					self.assertTrue(5 * s["eaten"] <= s["food"] <= 10 * s["eaten"])
+					self.assertLessEqual(s["blocked"], s["acted"])
 					assert_consistent(self, grid)
 					for key in events:
 						events[key] += s[key]
@@ -239,6 +243,60 @@ class RegrowthTest(unittest.TestCase):
 		for _ in range(10):
 			grid.respawn_food()
 		self.assertGreater(len(grid.food_items), 1)
+
+
+class SnapshotTest(unittest.TestCase):
+
+	def test_network_round_trip(self):
+		rng = random.Random(1)
+		nn = SimpleNN(rng)
+		copy = SimpleNN.from_flat(nn.flat(), rng)
+		x = np.linspace(-1, 1, 32)
+		np.testing.assert_allclose(copy.forward(x), nn.forward(x), rtol=1e-5, atol=1e-6)
+		self.assertEqual(nn.flat().shape, (16 * 32 + 16 + 8 * 16 + 8,))
+
+	def test_endgame_snapshots(self):
+		# a fake grid whose population follows a script: established, collapse, recovery, collapse, death
+		class FakeGrid:
+			agents, food_items = [], []
+		g = FakeGrid()
+		snaps = Snapshots(every=1000, max_networks=5, established=240)
+		snaps.start_run(1)
+		script = [100] * 10 + [300] * 10 + [15] * 250 + [60] * 10 + [10] * 50 + [0] * 5
+		for tick, n in enumerate(script):
+			g.agents = [Agent(0, 0, 0, (0, 0, 1)) for _ in range(n)]
+			snaps.update(g, 1, tick)
+
+		meta = snaps.arrays()["snap_meta"]
+		endgame_ticks = meta[meta[:, 3] == Snapshots.ENDGAME, 2].tolist()
+		# first collapse at tick 20: every 100 ticks while it lasts; second at 280: once (dies at 330)
+		self.assertEqual(endgame_ticks, [20, 120, 220, 280])
+		self.assertEqual(meta[meta[:, 3] == Snapshots.PERIODIC, 2].tolist(), [0])
+
+	def test_main_simulation_saves_snapshots(self):
+		params = dict(
+			width=20, height=20, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=2,
+			food_respawn_rate=0.012, num_agents=15, num_apples=60, num_oranges=60, num_walls=5, use_nn=True
+		)
+		with tempfile.TemporaryDirectory() as root, contextlib.redirect_stdout(io.StringIO()), \
+				mock.patch("environmental_abm.plt.show"):
+			results = main_simulation(
+				num_runs=2, num_ticks=30, num_prtrb_agents=2, init_seed=5, baseline=False, snapshot_every=10,
+				name="snap", results_dir=root, **params
+			)
+			s = np.load(os.path.join(results.dir, "snapshots.npz"))
+			periodic = s["snap_meta"][s["snap_meta"][:, 3] == Snapshots.PERIODIC]
+			# 2 runs x 2 grids x ticks 0, 10, 20, 30
+			self.assertEqual(len(periodic), 16)
+			self.assertEqual(sorted(set(periodic[:, 2].tolist())), [0, 10, 20, 30])
+			# tick 0: all 15 agents of every grid, each with its network
+			first = np.flatnonzero((s["snap_meta"][:, 2] == 0))
+			rows = np.isin(s["agent_data"][:, 0], first)
+			self.assertEqual(rows.sum(), 4 * 15)
+			self.assertTrue((s["agent_network"][rows] >= 0).all())
+			self.assertEqual(s["networks"].shape[1], 664)
+			# saved snapshot positions hold the agent count
+			self.assertEqual(len(s["agent_data"]), s["snap_meta"][:, 4].sum())
 
 
 class DivergenceTest(unittest.TestCase):

@@ -113,6 +113,7 @@ Each experiment saves its output to `results/<timestamp>_<name>/`:
 | `params.json` | experiment parameters |
 | `runs.csv` | per-run, per-grid stats: outcome, λ, desync and half-saturation ticks, late distances, ΔH, population, energy, event rates, baseline outcome |
 | `timeseries.npz` | per tick (index = tick): `d`; for both grids, shape (runs, 2, ticks + 1): `population`, `energy`, `sex1` (agents of sex 1), `food_items` and the event counters `acted`, `starved`, `fights`, `matings`, `failed_matings`, `births`, `food`, `metabolism`, `reproduction`, `residual`; with the baseline also `baseline_d` and `baseline_population` |
+| `snapshots.npz` | only with `snapshot_every`: agent positions, sex, energy and networks (up to 100 per grid) every `snapshot_every` ticks, plus all agents every 100 ticks while an established population is below 20 agents (see `Snapshots`) |
 | `plots/` | $d(t)$ plot for each run (perturbed and baseline), with both populations |
 | `states/` | initial and final grid snapshots of every run, always saved |
 
@@ -120,11 +121,15 @@ Pass `results_dir=None` to `main_simulation` to save nothing.
 
 ### Regrowth pilot
 
-`pilot_regrowth.py` asks whether adaptation helps or hurts the population depending on how food regrows. It compares world A (`regrowth="empty"`) with world B (`regrowth="logistic"`, $K = 5000$, $\rho = 0.065$). The two are calibrated so that random agents settle at the same population (about 550) and food stock (about 2480) in both. In world B, that stock is the logistic peak. Both worlds start pre-stocked with 8000 food items, so the start-up phase is the same. Conditions: random agents, evolving networks, crossover only (B only) and no inheritance. It runs 12 jobs in parallel (about 5–6 h on 6 cores / 12 threads) and writes `report.txt`:
+`pilot_regrowth.py` asks whether adaptation helps or hurts the population depending on how food regrows. It compares world A (`regrowth="empty"`) with world B (`regrowth="logistic"`, $K = 5000$, $\rho = 0.065$). The two are calibrated so that random agents settle at the same population (about 550) and food stock (about 2480) in both. In world B, that stock is the logistic peak. Both worlds start pre-stocked with 8000 food items, so the start-up phase is the same. Conditions: random agents, evolving networks, crossover only (B only) and no inheritance. Conditions are named `<world>_<agents>[_K<capacity>]`. Two batches are defined:
+- `pilot`: random, evolving and no-inheritance agents in A and B, plus crossover-only in B (seeds 123–142)
+- `snapshots`: evolving and crossover-only agents in A and B with agent snapshots (seeds 143–162), plus a K sweep in world B for agents that do not adapt (random and no inheritance)
+
+Each batch takes about 6 h on 6 cores / 12 threads and writes `report.txt`. The report merges several folders, for example the pilot's K = 5000 runs with the sweep:
 
 ```bash
-nohup python pilot_regrowth.py > pilot.log 2>&1 &
-python pilot_regrowth.py --report results/pilot_<timestamp>   # re-run the report
+nohup python pilot_regrowth.py snapshots > snapshots.log 2>&1 &
+python pilot_regrowth.py --report results/pilot_<timestamp> results/snapshots_<timestamp>
 ```
 
 ## Viewing plots

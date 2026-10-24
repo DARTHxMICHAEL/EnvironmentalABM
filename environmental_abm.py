@@ -17,7 +17,8 @@ directions = [
 # per-tick event and energy-flow counters (see Grid.move_agent)
 TICK_STATS = (
 	"acted", "starved", "fights", "matings", "failed_matings", "births",
-	"food", "metabolism", "reproduction", "residual"
+	"food", "metabolism", "reproduction", "residual",
+	"blocked", "eaten"  # moves into an edge or wall, food items eaten
 )
 
 # counters reported as per-agent rates, see event_rates
@@ -169,6 +170,22 @@ class SimpleNN:
 
 		mutate_matrix(self.W1)
 		mutate_matrix(self.W2)
+
+	def flat(self):
+		"""All weights as one float32 vector: W1, b1, W2, b2 (see from_flat)."""
+		return np.concatenate([self.W1.ravel(), self.b1, self.W2.ravel(), self.b2]).astype(np.float32)
+
+	@classmethod
+	def from_flat(cls, flat, rng, input_size=32, hidden_size=16, output_size=8):
+		"""Rebuild a network saved with flat(), e.g. from a snapshot."""
+		nn = cls(rng, input_size, hidden_size, output_size)
+		sizes = [hidden_size * input_size, hidden_size, output_size * hidden_size, output_size]
+		parts = np.split(np.asarray(flat, dtype=float), np.cumsum(sizes)[:-1])
+		nn.W1 = parts[0].reshape(hidden_size, input_size)
+		nn.b1 = parts[1]
+		nn.W2 = parts[2].reshape(output_size, hidden_size)
+		nn.b2 = parts[3]
+		return nn
 
 class Grid:
 	def __init__(self, width, height, metabolic_cost, min_child_energy, reproduction_cost, food_respawn_rate,
@@ -487,10 +504,12 @@ class Grid:
 
 			# check bounds
 			if not (0 <= nx < self.height and 0 <= ny < self.width):
+				self.stats["blocked"] += 1
 				continue
 
 			# blocked by wall
 			if isinstance(self.grid[nx][ny], Wall):
+				self.stats["blocked"] += 1
 				continue
 
 			target = self.grid[nx][ny]
@@ -499,6 +518,7 @@ class Grid:
 			if isinstance(target, Food):
 				agent.energy += target.energy
 				self.stats["food"] += target.energy
+				self.stats["eaten"] += 1
 				self.remove_object(target)
 
 			# meet with another agent
@@ -527,6 +547,7 @@ class Grid:
 			n = min(n, len(empty))
 		else:
 			n = int(len(empty) * self.food_respawn_rate)
+
 		for x, y in self.rng.sample(empty, n):
 			if self.rng.random() < 0.6:
 				food = Apple(x, y)
@@ -757,6 +778,81 @@ def event_rates(series, start):
 	}
 
 
+class Snapshots:
+	"""
+	Agent snapshots taken during compare_grids runs, saved to snapshots.npz.
+
+	periodic : every `every` ticks, starting at tick 0 - positions, sex and energy of all agents,
+	           networks of the first `max_networks` (the tick shuffles the agent list, so these
+	           are a random sample)
+	endgame  : once a grid has reached `established` agents and then falls below
+	           ENDGAME_POPULATION, everything about every agent, every ENDGAME_EVERY ticks until it
+	           recovers to RECOVERED_POPULATION or dies out (at most MAX_ENDGAME per grid)
+
+	Arrays (one row per snapshot / per agent / per saved network):
+	snap_meta     : run, grid, tick, kind (0 periodic, 1 endgame), population, food items
+	agent_data    : snapshot row, x, y, sex, energy
+	agent_network : row in networks, -1 if not saved
+	networks      : SimpleNN.flat() vectors
+	"""
+	PERIODIC, ENDGAME = 0, 1
+	ENDGAME_POPULATION = 20
+	RECOVERED_POPULATION = 50
+	ENDGAME_EVERY = 100
+	MAX_ENDGAME = 100
+
+	def __init__(self, every, max_networks, established):
+		self.every = every
+		self.max_networks = max_networks
+		self.established = established
+		self.run = 0
+		self.meta, self.agents, self.agent_net, self.networks = [], [], [], []
+		self.state = {}
+
+	def start_run(self, run):
+		self.run = run
+		self.state = {}  # grid -> {"established", "endgame_since", "endgames"}
+
+	def take(self, g, grid, tick, kind, max_networks):
+		snap = len(self.meta)
+		self.meta.append((self.run, grid, tick, kind, len(g.agents), len(g.food_items)))
+		for i, agent in enumerate(g.agents):
+			nn = getattr(agent, "nn", None)
+			net = -1
+			if nn is not None and i < max_networks:
+				net = len(self.networks)
+				self.networks.append(nn.flat())
+			self.agents.append((snap, agent.x, agent.y, agent.sex, agent.energy))
+			self.agent_net.append(net)
+
+	def update(self, g, grid, tick):
+		n = len(g.agents)
+		st = self.state.setdefault(grid, {"established": False, "endgame_since": None, "endgames": 0})
+		st["established"] |= n >= self.established
+
+		if tick % self.every == 0:
+			self.take(g, grid, tick, self.PERIODIC, self.max_networks)
+
+		if st["endgame_since"] is None:
+			if st["established"] and 0 < n < self.ENDGAME_POPULATION:
+				st["endgame_since"] = tick
+		elif n == 0 or n >= self.RECOVERED_POPULATION:
+			st["endgame_since"] = None
+		if (st["endgame_since"] is not None and (tick - st["endgame_since"]) % self.ENDGAME_EVERY == 0
+				and st["endgames"] < self.MAX_ENDGAME):
+			self.take(g, grid, tick, self.ENDGAME, n)
+			st["endgames"] += 1
+
+	def arrays(self):
+		return {
+			"snap_meta": np.array(self.meta, dtype=np.int64).reshape(-1, 6),
+			"agent_data": np.array(self.agents, dtype=np.float64).reshape(-1, 5),
+			"agent_network": np.array(self.agent_net, dtype=np.int32),
+			# random agents have no networks: keep the 2-D shape of SimpleNN.flat() rows
+			"networks": np.array(self.networks, dtype=np.float32) if self.networks else np.zeros((0, 664), np.float32),
+		}
+
+
 def new_series():
 	return {key: [] for key in SERIES}
 
@@ -770,7 +866,7 @@ def record(g, series):
 		series[key].append(g.stats[key])
 
 
-def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, g3=None, results=None, **grid_params):
+def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, g3=None, results=None, snapshots=None, **grid_params):
 	"""
 	Run two nearly identical grids in lockstep and measure how they diverge, compute the Shannon
 	entropy difference, and calculate basic regime stability metrics.
@@ -812,6 +908,8 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, g3=None, results=
 		Trial index for display purposes. Default 1.
 	g3 : Grid or None, optional
 		Baseline grid: same initial state as g1, different RNG stream. None skips the baseline.
+	snapshots : Snapshots or None, optional
+		Records agent snapshots of g1 and g2 (grid 1 and 2) during the run.
 	**grid_params : dict
 		Additional grid parameters required for entropy computation and population metrics.
 
@@ -855,6 +953,10 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, g3=None, results=
 	series = (new_series(), new_series())
 	for g, s in zip((g1, g2), series):
 		record(g, s)
+	if snapshots is not None:
+		snapshots.start_run(trial + 1)
+		for grid, g in enumerate((g1, g2), start=1):
+			snapshots.update(g, grid, 0)
 	diffs = [max(grid_difference(g1, g2), 1e-12)]
 
 	if g3 is not None:
@@ -879,6 +981,9 @@ def main_analysis(g1, g2, num_ticks=50, render=False, trial=1, g3=None, results=
 			g.move_agent()
 			g.respawn_food()
 			record(g, s)
+		if snapshots is not None:
+			for grid, g in enumerate((g1, g2), start=1):
+				snapshots.update(g, grid, t + 1)
 		diffs.append(max(grid_difference(g1, g2), 1e-12))
 
 		if g3 is not None:
@@ -1085,7 +1190,7 @@ def population_summary(runs, results, baseline=None):
 	log("* largest value in the column")
 
 
-def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=True, lyapunov_final_render=True, num_trials=30, baseline=True, results=None, **grid_params):
+def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=True, lyapunov_final_render=True, num_trials=30, baseline=True, results=None, snapshot_every=None, snapshot_networks=100, **grid_params):
 	"""
 	Compare two nearly identical grid simulations to measure their divergence,
 	Shannon entropy and aggregate regime statistics over multiple trials.
@@ -1101,6 +1206,11 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	baseline : bool, optional
 		Also run a third grid per trial, identical to grid 1 but with a different RNG stream
 		(see main_analysis). Costs 50% more run time. Default is True.
+	snapshot_every : int or None, optional
+		Save agent snapshots (positions, networks) every this many ticks, plus endgame
+		snapshots of collapsing populations, to snapshots.npz (see Snapshots). None saves none.
+	snapshot_networks : int, optional
+		Networks saved per periodic snapshot and grid. Default 100.
 
 	Returns
 	-------
@@ -1115,6 +1225,7 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	run_results = []
 	grid_runs = []  # (run, grid, population_stats + event_rates)
 	baseline_runs = {}  # run -> population_stats of the baseline grid
+	snapshots = Snapshots(snapshot_every, snapshot_networks, 2 * grid_params["num_agents"]) if snapshot_every else None
 
 	for trial in range(num_trials):
 		g1 = Grid(**grid_params, seed=seed + trial)
@@ -1135,7 +1246,7 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 			g3.rng.seed(BASELINE_SEED_OFFSET + seed + trial)
 
 		result = main_analysis(
-			g1, g2, num_ticks, lyapunov_final_render, trial, g3, results=results, **grid_params
+			g1, g2, num_ticks, lyapunov_final_render, trial, g3, results=results, snapshots=snapshots, **grid_params
 		)
 		run_results.append(result)
 		for grid, stats in enumerate(result["grids"], start=1):
@@ -1199,6 +1310,8 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 		arrays["baseline_d"] = np.array(column("baseline_diffs"))                 # (runs, ticks + 1)
 		arrays["baseline_population"] = np.array(column("baseline_population"))  # (runs, ticks + 1)
 	results.save_arrays("timeseries.npz", **arrays)
+	if snapshots is not None:
+		results.save_arrays("snapshots.npz", **snapshots.arrays())
 
 	return mean_lambda, mean_H
 
@@ -1263,7 +1376,7 @@ def check_determinism(num_ticks, seed, debug_render=False, final_render=True, re
 	return True
 
 
-def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=True, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
+def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=True, snapshot_every=None, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
 	"""
 	Execute the main experiment pipeline.
 
@@ -1281,6 +1394,8 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 		Random seed to ensure deterministic behavior.
 	baseline : bool, optional
 		Run a reseeded, unperturbed copy of grid 1 per run as a null model (see compare_grids).
+	snapshot_every : int or None, optional
+		Save agent snapshots every this many ticks (see compare_grids). None saves none.
 	name : str, optional
 		Experiment name, used for the output folder.
 	results_dir : str or None, optional
@@ -1295,7 +1410,7 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 	log = results.log
 	results.save_json("params.json", {
 		"name": name, "num_runs": num_runs, "num_ticks": num_ticks, "num_prtrb_agents": num_prtrb_agents,
-		"init_seed": init_seed, "baseline": baseline, **grid_params
+		"init_seed": init_seed, "baseline": baseline, "snapshot_every": snapshot_every, **grid_params
 	})
 
 	log("\n----- PARAMETERS LIST -----")
@@ -1330,7 +1445,10 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 		raise RuntimeError("Simulation environment is non-deterministic.")
 
 	log("\n----- DIVERGENCE COMPARISON -----")
-	compare_grids(num_ticks, num_prtrb_agents, init_seed, final_render, lyapunov_final_render, num_runs, baseline, results=results, **grid_params)
+	compare_grids(
+		num_ticks, num_prtrb_agents, init_seed, final_render, lyapunov_final_render, num_runs, baseline,
+		results=results, snapshot_every=snapshot_every, **grid_params
+	)
 	log("--------------------------------------")
 	return results
 
