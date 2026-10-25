@@ -10,12 +10,15 @@ so the start-up phase, when the initial networks barely forage, is the same in b
 Agents: random, neural with evolving networks, neural with crossover only, and neural with no
 inheritance (every child gets a fresh random network, so nothing adapts).
 
-Conditions are named <world>_<agents>[_K<capacity>], e.g. B_nn_evolve or B_random_K7000.
+Conditions are named <world>_<agents>[_K<capacity>][_n<move noise in %>], e.g. B_nn_evolve,
+B_random_K7000 or B_nn_evolve_n5.
 
 Batches:
 	pilot     - first go/no-go run: random, evolve and none in A and B, crossover-only in B
 	snapshots - evolve and crossover-only in A and B with agent snapshots (see Snapshots), plus
 	            the K sweep for agents that do not adapt (random, none) in B
+	noise     - neural agents that make a random move with probability 1% or 5% (move_noise): do
+	            populations still collapse when agents cannot get stuck? Same seeds as snapshots
 
 	python pilot_regrowth.py [batch]                 # run a batch in parallel, then report
 	python pilot_regrowth.py --report <folder> ...   # report on finished batches (merged)
@@ -40,7 +43,7 @@ from environmental_abm import main_simulation
 TICKS = int(os.environ.get("PILOT_TICKS", 30000))
 RUNS_PER_JOB = int(os.environ.get("PILOT_RUNS", 10))
 # first seed of each batch: the snapshots batch continues after the pilot's 20 seeds
-SEEDS = {"pilot": 123, "snapshots": 143}
+SEEDS = {"pilot": 123, "snapshots": 143, "noise": 143}
 
 COMMON = dict(
 	width=100, height=100, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=2,
@@ -73,6 +76,11 @@ BATCHES = {
 		*[(f"B_nn_none_K{k}", 1, SWEEP) for k in (3000, 4000, 7000, 10000)],
 		*[(f"B_random_K{k}", 1, SWEEP) for k in (3000, 4000, 6000, 7000, 8000, 10000)],
 	],
+	"noise": [
+		("B_nn_evolve_n5", 2, dict(snapshot_every=2500)), ("B_nn_no_mutation_n5", 2, {}),
+		("B_nn_evolve_n1", 2, {}), ("B_nn_no_mutation_n1", 2, {}),
+		("A_nn_evolve_n5", 2, {}), ("B_nn_none_n5", 1, {}),
+	],
 }
 
 WINDOWS = [(0, 1000), (1000, 3000), (3000, 6000), (6000, 10000), (10000, 15000),
@@ -80,11 +88,13 @@ WINDOWS = [(0, 1000), (1000, 3000), (3000, 6000), (6000, 10000), (10000, 15000),
 
 
 def params(condition):
-	match = re.fullmatch(r"([AB])_(.+?)(?:_K(\d+))?", condition)
-	world, agents, capacity = match.groups()
+	match = re.fullmatch(r"([AB])_(.+?)(?:_K(\d+))?(?:_n(\d+))?", condition)
+	world, agents, capacity, noise = match.groups()
 	p = {**COMMON, **WORLDS[world], **AGENTS[agents]}
 	if capacity:
 		p["food_capacity"] = int(capacity)
+	if noise:
+		p["move_noise"] = int(noise) / 100
 	return p
 
 
@@ -121,7 +131,7 @@ def load(roots):
 				print(f"skipped {path}: run length differs from earlier {condition} runs", file=sys.stderr)
 				continue
 			entry["rows"] += rows
-			for key in ("population", "food_items", "fights", "matings", "acted"):
+			for key in ("population", "sex1", "food_items", "fights", "matings", "acted"):
 				grids = s[key].reshape(-1, s[key].shape[-1])  # (runs * 2 grids, ticks + 1), same order as rows
 				entry["series"][key] = np.concatenate([entry["series"][key], grids]) if key in entry["series"] else grids
 	return data
@@ -145,14 +155,17 @@ def report(roots):
 		extinct = P[:, -1] == 0
 		ext_tick = np.where(extinct, np.argmax(P == 0, axis=1), -1)
 		late = extinct & established_once
+		# both sexes left at the end - a lone survivor or a single-sex remnant cannot reproduce
+		viable = (d["series"]["sex1"][:, -1] > 0) & (d["series"]["sex1"][:, -1] < P[:, -1])
 
 		log(f"=== {condition}  ({len(P)} grids, pairs share initial networks)")
-		log(f"  alive at end {np.sum(~extinct)}/{len(P)} | early extinctions (never > {2 * n0}) {np.sum(extinct & ~established_once)}"
+		log(f"  alive at end {np.sum(~extinct)}/{len(P)}, viable (both sexes) {np.sum(viable)}"
+			f" | early extinctions (never > {2 * n0}) {np.sum(extinct & ~established_once)}"
 			f" | LATE extinctions (after establishing) {np.sum(late)}"
 			+ (f", ticks {sorted(ext_tick[late].tolist())}" if late.any() else ""))
 		log(f"  {'window':>13} {'alive':>6} {'N mean':>8} {'N sd':>6} {'CV N':>5} {'food':>7} {'encounters/agent':>17}")
 		for a, b in WINDOWS:
-			if a >= P.shape[1]:
+			if b - P.shape[1] > (b - a) // 2:  # less than half of the window was simulated
 				break
 			alive = P[:, min(b, P.shape[1]) - 1] > 0
 			if not alive.any():
@@ -165,6 +178,20 @@ def report(roots):
 			log(f"  {a:>6}-{b:<6} {alive.sum():>6} {n.mean():>8.1f} {n.mean(axis=1).std():>6.1f} {cv:>5.2f} "
 				f"{F[alive, a:b].mean():>7.0f} {enc:>17.4f}")
 		log("")
+
+	# one line per condition: how many populations made it, and how they died
+	log("=== Survival overview")
+	log(f"  {'condition':<22} {'grids':>5} {'viable':>6} {'start-up deaths':>15} {'late deaths':>11} {'CV N, last 5000':>16}")
+	for condition in sorted(data):
+		P, sex1 = data[condition]["series"]["population"], data[condition]["series"]["sex1"]
+		viable = (sex1[:, -1] > 0) & (sex1[:, -1] < P[:, -1])
+		extinct = P[:, -1] == 0
+		established_once = (P > 2 * COMMON["num_agents"]).any(axis=1)
+		late = P[viable, -5000:]
+		cv = np.mean(late.std(axis=1) / late.mean(axis=1)) if viable.any() else float("nan")
+		log(f"  {condition:<22} {len(P):>5} {viable.sum():>6} {np.sum(extinct & ~established_once):>15} "
+			f"{np.sum(extinct & established_once):>11} {cv:>16.2f}")
+	log("")
 
 	# evolving populations relative to random agents in each world (at the pilot's K)
 	log("=== Adaptation summary (last 5000 ticks, grids alive at the end)")
@@ -188,11 +215,12 @@ def report(roots):
 	)
 	if sweep:
 		log("\n=== K sweep, world B (last third of each run; R* = mean food stock)")
-		log(f"  {'condition':<22} {'K':>6} {'alive':>7} {'N mean':>7} {'CV N':>5} {'R*':>6} {'R*/K':>5} {'food p5-p95':>13}")
+		log(f"  {'condition':<22} {'K':>6} {'viable':>7} {'N mean':>7} {'CV N':>5} {'R*':>6} {'R*/K':>5} {'food p5-p95':>13}")
 		for c in sweep:
 			P, F = data[c]["series"]["population"], data[c]["series"]["food_items"]
 			start = 2 * P.shape[1] // 3
-			alive = P[:, -1] > 0
+			sex1 = data[c]["series"]["sex1"][:, -1]
+			alive = (sex1 > 0) & (sex1 < P[:, -1])  # viable: both sexes left
 			k = capacity(c)
 			if not alive.any():
 				log(f"  {c:<22} {k:>6} {0:>3}/{len(P):<3}")

@@ -190,7 +190,7 @@ class SimpleNN:
 class Grid:
 	def __init__(self, width, height, metabolic_cost, min_child_energy, reproduction_cost, food_respawn_rate,
 	num_agents, num_apples, num_oranges, num_walls=30, use_nn=False, regrowth="empty", food_capacity=None,
-	inheritance="evolve", seed=123):
+	inheritance="evolve", move_noise=0.0, seed=123):
 		"""
 		regrowth      : "empty"    - floor(food_respawn_rate * empty cells) food items spawn per tick
 		                "logistic" - r * F * (1 - F / food_capacity) items, F = food items on the grid and
@@ -199,6 +199,7 @@ class Grid:
 		                "evolve"      - uniform crossover of the parents, then mutation
 		                "no_mutation" - crossover only, selection acts on the initial variation
 		                "none"        - a fresh random network, no heritability and no adaptation
+		move_noise    : chance that a neural agent makes a random move instead of its network's choice
 		"""
 		if regrowth not in ("empty", "logistic"):
 			raise ValueError(f"unknown regrowth rule: {regrowth}")
@@ -206,6 +207,8 @@ class Grid:
 			raise ValueError("logistic regrowth needs food_capacity")
 		if inheritance not in ("evolve", "no_mutation", "none"):
 			raise ValueError(f"unknown inheritance: {inheritance}")
+		if not 0 <= move_noise <= 1:
+			raise ValueError(f"move_noise must be in [0, 1]: {move_noise}")
 
 		self.width = width
 		self.height = height
@@ -221,6 +224,7 @@ class Grid:
 		self.regrowth = regrowth
 		self.food_capacity = food_capacity
 		self.inheritance = inheritance
+		self.move_noise = move_noise
 		self.rng = random.Random(seed)
 		self.stats = dict.fromkeys(TICK_STATS, 0)
 
@@ -491,8 +495,9 @@ class Grid:
 				self.exhaust_agent(agent)
 				continue
 
-			# artificial NN use
-			if self.use_nn:
+			# artificial NN use - with probability move_noise a random move instead (the draw is
+			# skipped when move_noise is 0, so runs without noise keep their random number sequence)
+			if self.use_nn and not (self.move_noise and self.rng.random() < self.move_noise):
 				vision = self.get_agent_vision(agent)
 				agent.vision = vision
 				dx, dy = agent.nn_output_to_move()
@@ -1435,6 +1440,7 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 		+ (f" (capacity {grid_params['food_capacity']})" if regrowth == "logistic" else ""))
 	if grid_params['use_nn']:
 		log(f"Network inheritance         : {grid_params.get('inheritance', 'evolve')}")
+		log(f"Move noise                  : {grid_params.get('move_noise', 0.0)}")
 	if results.dir:
 		log(f"Output folder               : {results.dir}")
 	log("--------------------------------------")

@@ -213,9 +213,29 @@ class InheritanceTest(unittest.TestCase):
 				self.assertEqual(np.array_equal(child.nn.W1, a.nn.W1), same_as_parents)
 
 	def test_invalid_options(self):
-		for overrides in ({"inheritance": "lamarck"}, {"regrowth": "linear"}, {"regrowth": "logistic"}):
+		for overrides in ({"inheritance": "lamarck"}, {"regrowth": "linear"}, {"regrowth": "logistic"}, {"move_noise": 1.5}):
 			with self.subTest(**overrides), self.assertRaises(ValueError):
 				empty_grid(**overrides)
+
+
+	def test_move_noise(self):
+		params = dict(
+			width=30, height=30, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=8,
+			food_respawn_rate=0.012, num_agents=40, num_apples=150, num_oranges=150, num_walls=10, use_nn=True, seed=3
+		)
+		# full noise: the networks are never asked
+		grid = Grid(**params, move_noise=1.0)
+		with mock.patch.object(SimpleNN, "forward", side_effect=AssertionError("network used")):
+			for _ in range(20):
+				grid.move_agent()
+		# some noise: still deterministic, and it changes the run
+		runs = [Grid(**params, move_noise=noise) for noise in (0.0, 0.2, 0.2)]
+		for _ in range(50):
+			for g in runs:
+				g.move_agent()
+				g.respawn_food()
+		self.assertEqual(grid_difference(runs[1], runs[2]), 0)
+		self.assertGreater(grid_difference(runs[0], runs[1]), 0)
 
 
 class RegrowthTest(unittest.TestCase):

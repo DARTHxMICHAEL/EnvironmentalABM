@@ -32,6 +32,7 @@ where $F$ is food eaten, $A$ the number of agents that acted, $P$ the number of 
 - **Network:** $32 \to 16 \to 8$ with
   $$\mathbf{y} = W_2 \tanh(W_1 \mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2, \qquad \text{move} = \arg\max_k y_k$$
 - **Inheritance:** each weight comes from either parent with probability 0.5 (uniform crossover). Then each weight mutates with probability 0.1: $w \leftarrow w + \mathcal{N}(0, 0.05^2)$. Mutations draw from the grid's RNG, so siblings mutate independently. `inheritance="no_mutation"` keeps only the crossover, and `inheritance="none"` gives every child a fresh random network, so nothing can adapt.
+- **Move noise:** with probability `move_noise` (default 0), a neural agent makes a random move instead of its network's choice. A network is deterministic and has no memory, so in a world that does not change it can lock into a loop, such as pushing against the border; noise breaks such loops.
 
 ## Analysis
 
@@ -124,6 +125,7 @@ Pass `results_dir=None` to `main_simulation` to save nothing.
 `pilot_regrowth.py` asks whether adaptation helps or hurts the population depending on how food regrows. It compares world A (`regrowth="empty"`) with world B (`regrowth="logistic"`, $K = 5000$, $\rho = 0.065$). The two are calibrated so that random agents settle at the same population (about 550) and food stock (about 2480) in both. In world B, that stock is the logistic peak. Both worlds start pre-stocked with 8000 food items, so the start-up phase is the same. Conditions: random agents, evolving networks, crossover only (B only) and no inheritance. Conditions are named `<world>_<agents>[_K<capacity>]`. Two batches are defined:
 - `pilot`: random, evolving and no-inheritance agents in A and B, plus crossover-only in B (seeds 123–142)
 - `snapshots`: evolving and crossover-only agents in A and B with agent snapshots (seeds 143–162), plus a K sweep in world B for agents that do not adapt (random and no inheritance)
+- `noise`: the same with `move_noise` of 1% and 5% (suffix `_n1`, `_n5`), same seeds as `snapshots`
 
 Each batch takes about 6 h on 6 cores / 12 threads and writes `report.txt`. The report merges several folders, for example the pilot's K = 5000 runs with the sweep:
 
