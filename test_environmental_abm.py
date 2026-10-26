@@ -319,6 +319,31 @@ class SnapshotTest(unittest.TestCase):
 			self.assertEqual(len(s["agent_data"]), s["snap_meta"][:, 4].sum())
 
 
+class ProbeTest(unittest.TestCase):
+
+	def test_arena_holds_food_and_agents(self):
+		from probe import ProbeGrid, arena, r_star
+		eaten, intake, blocked = arena(None, 500, seed=1, agents=50, ticks=30, warmup=5)
+		self.assertTrue(0 < eaten <= 1 and 5 * eaten <= intake <= 10 * eaten and 0 <= blocked <= 1)
+
+		g = ProbeGrid(width=20, height=20, metabolic_cost=0.9, min_child_energy=7, reproduction_cost=2,
+					  food_respawn_rate=0.0, num_agents=30, num_apples=0, num_oranges=0, num_walls=0, seed=2)
+		for agent in g.agents:
+			agent.energy = 1e9  # as in the arena: nobody starves
+		for _ in range(20):
+			g.move_agent()
+			g.top_up(100)
+			self.assertEqual(len(g.food_items), 100)
+		# nobody starves, fights or mates
+		self.assertEqual(len(g.agents), 30)
+		self.assertEqual(g.stats["fights"] + g.stats["matings"], 0)
+
+	def test_r_star(self):
+		from probe import r_star
+		self.assertAlmostEqual(r_star([0, 100, 200], [0.5, 0.8, 1.2]), 150)
+		self.assertTrue(np.isnan(r_star([0, 100], [0.1, 0.2])))
+
+
 class DivergenceTest(unittest.TestCase):
 
 	def test_divergence_stats(self):

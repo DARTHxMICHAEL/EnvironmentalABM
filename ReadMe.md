@@ -134,6 +134,15 @@ nohup python pilot_regrowth.py snapshots > snapshots.log 2>&1 &
 python pilot_regrowth.py --report results/pilot_<timestamp> results/snapshots_<timestamp>
 ```
 
+### Foraging probe
+
+`probe.py` measures how well agents forage at a given food level, which is their functional response. It takes frozen networks from `snapshots.npz` and places them in an arena where the food stock is held fixed: eaten food is replaced on random empty cells every tick. Agents never starve, fight or mate, so only foraging is measured. The result is the intake per agent and tick at each food level, and $R^*$, the food level at which intake covers the cost per agent and tick (1.0 by default: metabolism 0.9 plus reproduction costs). Random agents are probed as a calibration: their arena intake at $F \approx 2486$ matches the full model within about 6%.
+
+```bash
+python probe.py results/snapshots_<timestamp> results/noise_<timestamp>   # writes results/probe_<timestamp>/
+python probe.py --summary results/probe_<timestamp>
+```
+
 ## Viewing plots
 
 **Jupyter (recommended).** Plots appear in the browser, under the cell that made them. With the venv active:
