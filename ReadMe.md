@@ -127,10 +127,15 @@ Pass `results_dir=None` to `main_simulation` to save nothing.
 - `snapshots`: evolving and crossover-only agents in A and B with agent snapshots (seeds 143–162), plus a K sweep in world B for agents that do not adapt (random and no inheritance)
 - `noise`: the same with `move_noise` of 1% and 5% (suffix `_n1`, `_n5`), same seeds as `snapshots`
 
-Each batch takes about 6 h on 6 cores / 12 threads and writes `report.txt`. The report merges several folders, for example the pilot's K = 5000 runs with the sweep:
+- `sweep`: the main K sweep, about 750 CPU hours and 11 GB (see `--dry-run`). Evolving agents with 5% noise over K = 2000–10000 for 150k ticks, with snapshots every 5000 ticks; world A for 150k ticks as the stable reference; crossover-only (4 K values, 150k ticks); evolving agents without noise (5 K values, 50k ticks); and agents that do not adapt: no-inheritance with noise over the same K, random agents over K = 2000–15000 (30k ticks). 20 fresh seeds each (301–320), in jobs of 2 seeds.
+
+Each of the first three batches takes about 6 h on 6 cores / 12 threads, and every batch writes `report.txt`. For long batches, `--dry-run` lists the jobs with rough CPU hours and storage, `--resume <folder>` continues a stopped batch (finished jobs are skipped), a failing job is logged to `errors.log` instead of stopping the batch, and `PILOT_WORKERS` sets the number of parallel processes. The report merges several folders, for example the pilot's K = 5000 runs with the sweep:
 
 ```bash
 nohup python pilot_regrowth.py snapshots > snapshots.log 2>&1 &
+python pilot_regrowth.py sweep --dry-run
+nohup python pilot_regrowth.py sweep > sweep.log 2>&1 &
+nohup python pilot_regrowth.py sweep --resume results/sweep_<timestamp> >> sweep.log 2>&1 &
 python pilot_regrowth.py --report results/pilot_<timestamp> results/snapshots_<timestamp>
 ```
 

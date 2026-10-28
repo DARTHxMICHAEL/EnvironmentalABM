@@ -14,7 +14,8 @@ world B, K = 5000), so they check whether the arena reproduces what the full mod
 	python probe.py --summary <probe folder>  # summarize a finished probe again
 
 Options (environment): PROBE_GRIDS grids per condition and tick (default 10), PROBE_AGENTS agents
-per arena (300), PROBE_TICKS measured ticks per food level (150).
+per arena (300), PROBE_TICKS measured ticks per food level (150), PROBE_SNAPSHOT_TICKS which
+snapshots to probe (default 0,2500,5000,10000,20000,30000; the sweep saves every 5000 up to 150000).
 """
 import os
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -31,7 +32,7 @@ import numpy as np
 from environmental_abm import Agent, Apple, Grid, Orange, SimpleNN
 
 FOOD_LEVELS = [100, 250, 500, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 6500, 8000]
-SNAPSHOT_TICKS = [0, 2500, 5000, 10000, 20000, 30000]
+SNAPSHOT_TICKS = [int(t) for t in os.environ.get("PROBE_SNAPSHOT_TICKS", "0,2500,5000,10000,20000,30000").split(",")]
 GRIDS = int(os.environ.get("PROBE_GRIDS", 10))
 AGENTS = int(os.environ.get("PROBE_AGENTS", 300))
 TICKS = int(os.environ.get("PROBE_TICKS", 150))

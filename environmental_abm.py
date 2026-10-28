@@ -1253,6 +1253,8 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 		result = main_analysis(
 			g1, g2, num_ticks, lyapunov_final_render, trial, g3, results=results, snapshots=snapshots, **grid_params
 		)
+		# pack this run's per-tick series right away: as Python lists they cost ~30x the memory
+		result["series"] = [{key: compact(values) for key, values in grid.items()} for grid in result["series"]]
 		run_results.append(result)
 		for grid, stats in enumerate(result["grids"], start=1):
 			grid_runs.append((trial + 1, grid, stats))
@@ -1305,9 +1307,8 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 	])
 
 	def stacked(key):
-		# (runs, 2 grids, ticks + 1); counts as int32, energies as float32 to keep the file small
-		values = np.array([[s[key] for s in res["series"]] for res in run_results])
-		return values.astype(np.float32 if values.dtype.kind == "f" else np.int32)
+		# (runs, 2 grids, ticks + 1)
+		return np.array([[s[key] for s in res["series"]] for res in run_results])
 
 	arrays = {key: stacked(key) for key in SERIES}
 	arrays["d"] = np.array(column("diffs"))  # (runs, ticks + 1)
@@ -1319,6 +1320,12 @@ def compare_grids(num_ticks=50, num_perturbed_agents=1, seed=123, final_render=T
 		results.save_arrays("snapshots.npz", **snapshots.arrays())
 
 	return mean_lambda, mean_H
+
+
+def compact(values):
+	"""A per-tick series as a small array: counts as int32, energies as float32."""
+	values = np.asarray(values)
+	return values.astype(np.float32 if values.dtype.kind == "f" else np.int32)
 
 
 def check_determinism(num_ticks, seed, debug_render=False, final_render=True, results=None, **grid_params):
@@ -1381,7 +1388,7 @@ def check_determinism(num_ticks, seed, debug_render=False, final_render=True, re
 	return True
 
 
-def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=True, snapshot_every=None, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
+def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=True, snapshot_every=None, determinism_ticks=None, debug_render=False, final_render=False, lyapunov_final_render=False, name="experiment", results_dir="results", **grid_params):
 	"""
 	Execute the main experiment pipeline.
 
@@ -1401,6 +1408,8 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 		Run a reseeded, unperturbed copy of grid 1 per run as a null model (see compare_grids).
 	snapshot_every : int or None, optional
 		Save agent snapshots every this many ticks (see compare_grids). None saves none.
+	determinism_ticks : int or None, optional
+		Length of the determinism check. None checks over all num_ticks.
 	name : str, optional
 		Experiment name, used for the output folder.
 	results_dir : str or None, optional
@@ -1445,7 +1454,7 @@ def main_simulation(num_runs, num_ticks, num_prtrb_agents, init_seed, baseline=T
 		log(f"Output folder               : {results.dir}")
 	log("--------------------------------------")
 
-	is_deterministic = check_determinism(num_ticks=num_ticks,seed=init_seed,debug_render=debug_render,final_render=final_render,results=results,**grid_params)
+	is_deterministic = check_determinism(num_ticks=determinism_ticks or num_ticks,seed=init_seed,debug_render=debug_render,final_render=final_render,results=results,**grid_params)
 
 	if not is_deterministic:
 		raise RuntimeError("Simulation environment is non-deterministic.")
