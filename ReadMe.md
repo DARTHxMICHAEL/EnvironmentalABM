@@ -136,6 +136,7 @@ nohup python pilot_regrowth.py snapshots > snapshots.log 2>&1 &
 python pilot_regrowth.py sweep --dry-run
 nohup python pilot_regrowth.py sweep > sweep.log 2>&1 &
 nohup python pilot_regrowth.py sweep --resume results/sweep_<timestamp> >> sweep.log 2>&1 &
+python pilot_regrowth.py --status results/sweep_<timestamp>    # progress: finished, started, failed
 python pilot_regrowth.py --report results/pilot_<timestamp> results/snapshots_<timestamp>
 ```
 

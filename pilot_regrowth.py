@@ -27,6 +27,7 @@ Batches:
 	python pilot_regrowth.py [batch]                       # run a batch in parallel, then report
 	python pilot_regrowth.py [batch] --dry-run             # list jobs with rough CPU time and storage
 	python pilot_regrowth.py [batch] --resume <folder>     # continue a stopped batch, skipping finished jobs
+	python pilot_regrowth.py --status <folder>             # progress of a running batch
 	python pilot_regrowth.py --report <folder> ...         # report on finished batches (merged)
 
 Environment: PILOT_WORKERS parallel processes (default: all CPUs), PILOT_TICKS / PILOT_RUNS /
@@ -225,6 +226,35 @@ def capacity(condition):
 	return params(condition).get("food_capacity")
 
 
+def status(root):
+	"""Progress of a batch folder: finished, started and failed jobs, and the CPU time left."""
+	batch = os.path.basename(os.path.normpath(root)).split("_")[0]
+	jobs = jobs_of(batch, root) if batch in BATCHES else []
+	done = finished(root)
+	started = []
+	for folder in sorted(os.listdir(root)):
+		path = os.path.join(root, folder)
+		if os.path.isdir(path) and not os.path.exists(os.path.join(path, "timeseries.npz")):
+			with open(os.path.join(path, "summary.txt")) as f:
+				last = [line.strip() for line in f if line.strip()][-1]
+			age = (datetime.now().timestamp() - os.path.getmtime(os.path.join(path, "summary.txt"))) / 3600
+			started.append((folder, last, age))
+	errors = os.path.join(root, "errors.log")
+	failed = 0
+	if os.path.exists(errors):
+		with open(errors) as f:
+			failed = sum(line.startswith("[") for line in f)
+	left = sum(estimate(job)[0] for job in jobs if f"{job[0]}__s{job[1]}" not in done)
+
+	print(f"{root}: {len(done)} of {len(jobs) or '?'} jobs finished, {len(started)} started, {failed} failed")
+	if jobs:
+		print(f"  CPU hours left (rough): {left:.0f}, about {left / WORKERS:.0f} h with {WORKERS} workers")
+	for folder, last, age in started:
+		print(f"  started: {folder}\n           last line {age:.1f} h ago: {last[:100]}")
+	if failed:
+		print(f"  see {errors}")
+
+
 def instability_onset(P, start=3000, block=1000, threshold=0.4):
 	"""Per grid: first tick of a block (after `start`) where N swings (CV > threshold) or hits 0; nan if never."""
 	blocks = (P.shape[1] - start) // block
@@ -341,6 +371,9 @@ def report(roots):
 
 
 if __name__ == "__main__":
+	if len(sys.argv) == 3 and sys.argv[1] == "--status":
+		status(sys.argv[2])
+		sys.exit()
 	if len(sys.argv) >= 3 and sys.argv[1] == "--report":
 		report(sys.argv[2:])
 		sys.exit()
